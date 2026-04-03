@@ -1,0 +1,647 @@
+@using Koreny.Models
+@using Microsoft.JSInterop
+@implements IAsyncDisposable
+
+@if (string.IsNullOrEmpty(RootPersonId) || _root is null)
+{
+    <p role="status">Vyberte osobu pro zobrazení rodokmenu.</p>
+}
+else
+{
+    <div style="margin-bottom: 0.75rem;">
+        <button type="button" @onclick="DownloadSvgAsync">Stáhnout SVG</button>
+        <button type="button" @onclick="PrintSvgAsync">Tisk</button>
+    </div>
+    <svg width="@_svgWidth" height="@_svgHeight" xmlns="http://www.w3.org/2000/svg" style="display: block; max-width: 100%; height: auto;">
+        <g stroke="#666" stroke-width="1" fill="none">
+            @foreach (var seg in _segments)
+            {
+                <line x1="@F(seg.X1)" y1="@F(seg.Y1)" x2="@F(seg.X2)" y2="@F(seg.Y2)" />
+            }
+        </g>
+        @foreach (var n in _nodes)
+        {
+            var left = n.CenterX - NodeWidth * 0.5;
+            var top = n.CenterY - NodeHeight * 0.5;
+            <g style="cursor: pointer;" @onclick="@(() => OnNodeClickAsync(n.Id))" @ondblclick="@(() => OnNodeDoubleClickAsync(n.Id))" @onclick:stopPropagation="true">
+                <title>@n.FullName — @n.Lifespan</title>
+                <rect x="@F(left)" y="@F(top)" width="@F(NodeWidth)" height="@F(NodeHeight)"
+                      fill="#f9f9f9" stroke="#333" />
+                <text x="@F(n.CenterX)" y="@F(n.CenterY - TextLineOffsetY)" text-anchor="middle" font-size="@F(NameFontSize)" fill="#111">@Truncate(n.FullName)</text>
+                <text x="@F(n.CenterX)" y="@F(n.CenterY + LifespanLineOffsetY)" text-anchor="middle" font-size="@F(LifespanFontSize)" fill="#444">@n.Lifespan</text>
+            </g>
+        }
+    </svg>
+}
+
+@code {
+    private const double NodeWidth = 140;
+    private const double NodeHeight = 48;
+    /// <summary>Vertical gap between stacked rows (centre-to-centre minus node height is handled by row stepping).</summary>
+    private const double VerticalGap = 40;
+    private const double HorizontalGapGrandparentPair = 10;
+    private const double HorizontalGapBetweenClusters = 44;
+    private const double HorizontalGapParents = 36;
+    private const double HorizontalGapChildren = 12;
+    private const double SvgPadding = 20;
+    private const double NameFontSize = 12;
+    private const double LifespanFontSize = 11;
+    private const double TextLineOffsetY = 6;
+    private const double LifespanLineOffsetY = 14;
+    private const int MaxNameChars = 22;
+
+    private GedcomIndividual? _root;
+    private readonly List<LayoutNode> _nodes = new();
+    private readonly List<LineSegment> _segments = new();
+    private double _svgWidth = SvgPadding * 2;
+    private double _svgHeight = SvgPadding * 2;
+
+    [Parameter]
+    public GedcomDocument? Document { get; set; }
+
+    [Parameter]
+    public string? RootPersonId { get; set; }
+
+    [Parameter]
+    public EventCallback<string> OnPersonSelected { get; set; }
+
+    [Parameter]
+    public EventCallback<string> OnPersonDoubleClicked { get; set; }
+
+    [Inject]
+    public IJSRuntime JSRuntime { get; set; } = null!;
+
+    private IJSObjectReference? _exportModule;
+
+    /// <summary>Delays single-click so double-click does not also fire a spurious re-root.</summary>
+    private CancellationTokenSource? _singleClickCts;
+
+    private async Task OnNodeClickAsync(string id)
+    {
+        _singleClickCts?.Cancel();
+        _singleClickCts?.Dispose();
+        _singleClickCts = new CancellationTokenSource();
+        var token = _singleClickCts.Token;
+        try
+        {
+            await Task.Delay(280, token);
+            await OnPersonSelected.InvokeAsync(id);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private async Task OnNodeDoubleClickAsync(string id)
+    {
+        _singleClickCts?.Cancel();
+        _singleClickCts?.Dispose();
+        _singleClickCts = null;
+        await OnPersonSelected.InvokeAsync(id);
+        if (OnPersonDoubleClicked.HasDelegate)
+        {
+            await OnPersonDoubleClicked.InvokeAsync(id);
+        }
+    }
+
+    protected override void OnParametersSet()
+    {
+        _nodes.Clear();
+        _segments.Clear();
+        if (Document is null)
+        {
+            _root = null;
+            return;
+        }
+
+        _root = FindIndividual(Document, RootPersonId ?? string.Empty);
+        if (_root is null)
+        {
+            return;
+        }
+
+        var rootId = _root.Id;
+        var famAsChild = FindFamilyAsChild(Document, rootId);
+        var fatherId = famAsChild?.HusbandId;
+        var motherId = famAsChild?.WifeId;
+        var father = FindIndividual(Document, fatherId);
+        var mother = FindIndividual(Document, motherId);
+
+        GedcomIndividual? pgf = null;
+        GedcomIndividual? pgm = null;
+        GedcomIndividual? mgf = null;
+        GedcomIndividual? mgm = null;
+
+        if (father is not null)
+        {
+            var ff = FindFamilyAsChild(Document, father.Id);
+            pgf = FindIndividual(Document, ff?.HusbandId);
+            pgm = FindIndividual(Document, ff?.WifeId);
+        }
+
+        if (mother is not null)
+        {
+            var mf = FindFamilyAsChild(Document, mother.Id);
+            mgf = FindIndividual(Document, mf?.HusbandId);
+            mgm = FindIndividual(Document, mf?.WifeId);
+        }
+
+        var childIds = FindChildrenIds(Document, rootId);
+        childIds.Sort(StringComparer.Ordinal);
+        var children = childIds
+            .Select(id => FindIndividual(Document, id))
+            .Where(c => c is not null)
+            .Cast<GedcomIndividual>()
+            .ToList();
+
+        BuildLayout(pgf, pgm, mgf, mgm, father, mother, _root, children);
+    }
+
+    private void BuildLayout(
+        GedcomIndividual? pgf,
+        GedcomIndividual? pgm,
+        GedcomIndividual? mgf,
+        GedcomIndividual? mgm,
+        GedcomIndividual? father,
+        GedcomIndividual? mother,
+        GedcomIndividual root,
+        IReadOnlyList<GedcomIndividual> children)
+    {
+        var rows = new List<RowSpec>();
+
+        var gpList = new List<GedcomIndividual?>(4) { pgf, pgm, mgf, mgm };
+        if (gpList.Any(x => x is not null))
+        {
+            rows.Add(new RowSpec(RowKind.Grandparents, gpList));
+        }
+
+        var parList = new List<GedcomIndividual?> { father, mother };
+        if (parList.Any(x => x is not null))
+        {
+            rows.Add(new RowSpec(RowKind.Parents, parList));
+        }
+
+        rows.Add(new RowSpec(RowKind.Root, new List<GedcomIndividual?> { root }));
+
+        if (children.Count > 0)
+        {
+            rows.Add(new RowSpec(RowKind.Children, children.Cast<GedcomIndividual?>().ToList()));
+        }
+
+        var y = SvgPadding + NodeHeight * 0.5;
+
+        foreach (var row in rows)
+        {
+            LayoutRow(row, y, out _);
+            y += NodeHeight + VerticalGap;
+        }
+
+        if (_nodes.Count == 0)
+        {
+            return;
+        }
+
+        var minX = _nodes.Min(n => n.CenterX - NodeWidth * 0.5) - SvgPadding;
+        var shiftX = SvgPadding - minX;
+        if (shiftX != 0)
+        {
+            foreach (var n in _nodes)
+            {
+                n.CenterX += shiftX;
+            }
+        }
+
+        var maxX = _nodes.Max(n => n.CenterX + NodeWidth * 0.5) + SvgPadding;
+        var maxY = _nodes.Max(n => n.CenterY + NodeHeight * 0.5) + SvgPadding;
+        _svgWidth = Math.Max(maxX, SvgPadding * 2);
+        _svgHeight = Math.Max(maxY, SvgPadding * 2);
+
+        ConnectTreeEdges(pgf, pgm, mgf, mgm, father, mother, root, children);
+    }
+
+    private async Task DownloadSvgAsync()
+    {
+        if (_root is null)
+        {
+            return;
+        }
+
+        var module = await GetExportModuleAsync();
+        var name = SanitizeFileName($"koreny-{_root.Id}.svg");
+        await module.InvokeVoidAsync("downloadSvg", BuildSvgMarkup(), name);
+    }
+
+    private async Task PrintSvgAsync()
+    {
+        if (_root is null)
+        {
+            return;
+        }
+
+        var module = await GetExportModuleAsync();
+        await module.InvokeVoidAsync("printSvg", BuildSvgMarkup());
+    }
+
+    private async ValueTask<IJSObjectReference> GetExportModuleAsync()
+    {
+        if (_exportModule is not null)
+        {
+            return _exportModule;
+        }
+
+        _exportModule = await JSRuntime.InvokeAsync<IJSObjectReference>("import", "./js/export.js");
+        return _exportModule;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _singleClickCts?.Cancel();
+        _singleClickCts?.Dispose();
+        _singleClickCts = null;
+        if (_exportModule is not null)
+        {
+            await _exportModule.DisposeAsync();
+            _exportModule = null;
+        }
+    }
+
+    private string BuildSvgMarkup()
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"").Append(F(_svgWidth)).Append("\" height=\"").Append(F(_svgHeight)).Append("\" style=\"display:block;max-width:100%;height:auto\">");
+        sb.Append("<g stroke=\"#666\" stroke-width=\"1\" fill=\"none\">");
+        foreach (var seg in _segments)
+        {
+            sb.Append("<line x1=\"").Append(F(seg.X1)).Append("\" y1=\"").Append(F(seg.Y1)).Append("\" x2=\"").Append(F(seg.X2)).Append("\" y2=\"").Append(F(seg.Y2)).Append("\"/>");
+        }
+
+        sb.Append("</g>");
+        foreach (var n in _nodes)
+        {
+            var left = n.CenterX - NodeWidth * 0.5;
+            var top = n.CenterY - NodeHeight * 0.5;
+            sb.Append("<g>");
+            sb.Append("<title>").Append(XmlEscape($"{n.FullName} — {n.Lifespan}")).Append("</title>");
+            sb.Append("<rect x=\"").Append(F(left)).Append("\" y=\"").Append(F(top)).Append("\" width=\"").Append(F(NodeWidth)).Append("\" height=\"").Append(F(NodeHeight)).Append("\" fill=\"#f9f9f9\" stroke=\"#333\"/>");
+            sb.Append("<text x=\"").Append(F(n.CenterX)).Append("\" y=\"").Append(F(n.CenterY - TextLineOffsetY)).Append("\" text-anchor=\"middle\" font-size=\"").Append(F(NameFontSize)).Append("\" fill=\"#111\">").Append(XmlEscape(Truncate(n.FullName))).Append("</text>");
+            sb.Append("<text x=\"").Append(F(n.CenterX)).Append("\" y=\"").Append(F(n.CenterY + LifespanLineOffsetY)).Append("\" text-anchor=\"middle\" font-size=\"").Append(F(LifespanFontSize)).Append("\" fill=\"#444\">").Append(XmlEscape(n.Lifespan)).Append("</text>");
+            sb.Append("</g>");
+        }
+
+        sb.Append("</svg>");
+        return sb.ToString();
+    }
+
+    private static string XmlEscape(string s) =>
+        s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;");
+
+    private static string SanitizeFileName(string name)
+    {
+        ReadOnlySpan<char> invalid = Path.GetInvalidFileNameChars();
+        var sb = new System.Text.StringBuilder(name.Length);
+        foreach (var c in name)
+        {
+            sb.Append(invalid.Contains(c) ? '_' : c);
+        }
+
+        return sb.ToString();
+    }
+
+    /// <summary>Edges follow known pedigree links; row order alone is not enough when optional rows are omitted.</summary>
+    private void ConnectTreeEdges(
+        GedcomIndividual? pgf,
+        GedcomIndividual? pgm,
+        GedcomIndividual? mgf,
+        GedcomIndividual? mgm,
+        GedcomIndividual? father,
+        GedcomIndividual? mother,
+        GedcomIndividual root,
+        IReadOnlyList<GedcomIndividual> children)
+    {
+        var byId = _nodes.ToDictionary(n => n.Id, StringComparer.Ordinal);
+
+        void Link(string? aId, string? bId)
+        {
+            if (string.IsNullOrEmpty(aId) || string.IsNullOrEmpty(bId))
+            {
+                return;
+            }
+
+            if (!byId.TryGetValue(aId, out var a) || !byId.TryGetValue(bId, out var b))
+            {
+                return;
+            }
+
+            AddEdge(a.CenterX, BottomY(a), b.CenterX, TopY(b));
+        }
+
+        if (father is not null)
+        {
+            if (pgf is not null)
+            {
+                Link(pgf.Id, father.Id);
+            }
+
+            if (pgm is not null)
+            {
+                Link(pgm.Id, father.Id);
+            }
+        }
+
+        if (mother is not null)
+        {
+            if (mgf is not null)
+            {
+                Link(mgf.Id, mother.Id);
+            }
+
+            if (mgm is not null)
+            {
+                Link(mgm.Id, mother.Id);
+            }
+        }
+
+        if (father is not null)
+        {
+            Link(father.Id, root.Id);
+        }
+
+        if (mother is not null)
+        {
+            Link(mother.Id, root.Id);
+        }
+
+        foreach (var c in children)
+        {
+            Link(root.Id, c.Id);
+        }
+    }
+
+    private List<LayoutNode> LayoutRow(RowSpec row, double centerY, out double usedWidth)
+    {
+        usedWidth = 0;
+        var result = new List<LayoutNode>();
+
+        switch (row.Kind)
+        {
+            case RowKind.Grandparents:
+                result.AddRange(LayoutGrandparentRow(row.Individuals, centerY, out usedWidth));
+                break;
+            case RowKind.Parents:
+                result.AddRange(LayoutParentRow(row.Individuals, centerY, out usedWidth));
+                break;
+            case RowKind.Root:
+                result.AddRange(LayoutRootRow(row.Individuals[0]!, centerY, out usedWidth));
+                break;
+            case RowKind.Children:
+                result.AddRange(LayoutChildrenRow(row.Individuals, centerY, out usedWidth));
+                break;
+        }
+
+        _nodes.AddRange(result);
+        return result;
+    }
+
+    private IEnumerable<LayoutNode> LayoutGrandparentRow(IReadOnlyList<GedcomIndividual?> gp, double centerY, out double usedWidth)
+    {
+        var nodes = new List<LayoutNode>();
+        var paternal = new[] { gp[0], gp[1] }.Where(x => x is not null).Cast<GedcomIndividual>().ToList();
+        var maternal = new[] { gp[2], gp[3] }.Where(x => x is not null).Cast<GedcomIndividual>().ToList();
+
+        // Two side-by-side clusters keeps father under paternal line and mother under maternal line (hourglass symmetry).
+        var leftW = ClusterWidth(paternal);
+        var rightW = ClusterWidth(maternal);
+        var gapBetween = (leftW > 0 && rightW > 0) ? HorizontalGapBetweenClusters : 0;
+        var total = leftW + gapBetween + rightW;
+        usedWidth = total;
+        if (total <= 0)
+        {
+            return nodes;
+        }
+
+        var startX = -total * 0.5;
+        var x = startX;
+        for (var i = 0; i < paternal.Count; i++)
+        {
+            nodes.Add(CreateNode(paternal[i], x + NodeWidth * 0.5, centerY));
+            if (i < paternal.Count - 1)
+            {
+                x += NodeWidth + HorizontalGapGrandparentPair;
+            }
+        }
+
+        if (maternal.Count == 0)
+        {
+            return nodes;
+        }
+
+        x = startX + leftW + gapBetween;
+        for (var i = 0; i < maternal.Count; i++)
+        {
+            nodes.Add(CreateNode(maternal[i], x + NodeWidth * 0.5, centerY));
+            if (i < maternal.Count - 1)
+            {
+                x += NodeWidth + HorizontalGapGrandparentPair;
+            }
+        }
+
+        return nodes;
+    }
+
+    private static double ClusterWidth(IReadOnlyList<GedcomIndividual> people)
+    {
+        if (people.Count == 0)
+        {
+            return 0;
+        }
+
+        return people.Count * NodeWidth + (people.Count - 1) * HorizontalGapGrandparentPair;
+    }
+
+    private IEnumerable<LayoutNode> LayoutParentRow(IReadOnlyList<GedcomIndividual?> parents, double centerY, out double usedWidth)
+    {
+        var list = parents.Where(p => p is not null).Cast<GedcomIndividual>().ToList();
+        if (list.Count == 0)
+        {
+            usedWidth = 0;
+            return Array.Empty<LayoutNode>();
+        }
+
+        usedWidth = list.Count * NodeWidth + (list.Count - 1) * HorizontalGapParents;
+        var startX = -usedWidth * 0.5;
+        var x = startX;
+        var nodes = new List<LayoutNode>();
+        for (var i = 0; i < list.Count; i++)
+        {
+            nodes.Add(CreateNode(list[i], x + NodeWidth * 0.5, centerY));
+            if (i < list.Count - 1)
+            {
+                x += NodeWidth + HorizontalGapParents;
+            }
+        }
+
+        return nodes;
+    }
+
+    private IEnumerable<LayoutNode> LayoutRootRow(GedcomIndividual root, double centerY, out double usedWidth)
+    {
+        usedWidth = NodeWidth;
+        return new[] { CreateNode(root, 0, centerY) };
+    }
+
+    private IEnumerable<LayoutNode> LayoutChildrenRow(IReadOnlyList<GedcomIndividual?> children, double centerY, out double usedWidth)
+    {
+        var list = children.Where(c => c is not null).Cast<GedcomIndividual>().ToList();
+        usedWidth = list.Count * NodeWidth + (list.Count - 1) * HorizontalGapChildren;
+        var startX = -usedWidth * 0.5;
+        var x = startX;
+        var nodes = new List<LayoutNode>();
+        for (var i = 0; i < list.Count; i++)
+        {
+            nodes.Add(CreateNode(list[i], x + NodeWidth * 0.5, centerY));
+            if (i < list.Count - 1)
+            {
+                x += NodeWidth + HorizontalGapChildren;
+            }
+        }
+
+        return nodes;
+    }
+
+    private static LayoutNode CreateNode(GedcomIndividual i, double centerX, double centerY) =>
+        new()
+        {
+            Id = i.Id,
+            CenterX = centerX,
+            CenterY = centerY,
+            FullName = string.IsNullOrWhiteSpace(i.FullName) ? i.Id : i.FullName,
+            Lifespan = FormatLifespan(i),
+        };
+
+    private static string FormatLifespan(GedcomIndividual i)
+    {
+        var b = i.Birth?.ParsedYear;
+        var d = i.Death?.ParsedYear;
+        if (b is not null && d is not null)
+        {
+            return $"{b}–{d}";
+        }
+
+        if (b is not null)
+        {
+            return $"{b}–";
+        }
+
+        if (d is not null)
+        {
+            return $"–{d}";
+        }
+
+        return "";
+    }
+
+    private static string Truncate(string s)
+    {
+        if (s.Length <= MaxNameChars)
+        {
+            return s;
+        }
+
+        return s[..(MaxNameChars - 1)] + "…";
+    }
+
+    private static string F(double v) => v.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    private static double TopY(LayoutNode n) => n.CenterY - NodeHeight * 0.5;
+    private static double BottomY(LayoutNode n) => n.CenterY + NodeHeight * 0.5;
+
+    private void AddEdge(double x1, double y1, double x2, double y2)
+    {
+        _segments.Add(new LineSegment { X1 = x1, Y1 = y1, X2 = x2, Y2 = y2 });
+    }
+
+    private static GedcomIndividual? FindIndividual(GedcomDocument doc, string? id)
+    {
+        if (string.IsNullOrEmpty(id))
+        {
+            return null;
+        }
+
+        foreach (var i in doc.Individuals)
+        {
+            if (i.Id == id)
+            {
+                return i;
+            }
+        }
+
+        return null;
+    }
+
+    private static GedcomFamily? FindFamilyAsChild(GedcomDocument doc, string childId)
+    {
+        foreach (var fam in doc.Families)
+        {
+            if (fam.ChildrenIds.Contains(childId))
+            {
+                return fam;
+            }
+        }
+
+        return null;
+    }
+
+    private static List<string> FindChildrenIds(GedcomDocument doc, string personId)
+    {
+        var set = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var fam in doc.Families)
+        {
+            if (fam.HusbandId == personId || fam.WifeId == personId)
+            {
+                foreach (var c in fam.ChildrenIds)
+                {
+                    set.Add(c);
+                }
+            }
+        }
+
+        return set.ToList();
+    }
+
+    private enum RowKind
+    {
+        Grandparents,
+        Parents,
+        Root,
+        Children,
+    }
+
+    private sealed class RowSpec
+    {
+        public RowSpec(RowKind kind, List<GedcomIndividual?> individuals)
+        {
+            Kind = kind;
+            Individuals = individuals;
+        }
+
+        public RowKind Kind { get; }
+        public List<GedcomIndividual?> Individuals { get; }
+    }
+
+    private sealed class LayoutNode
+    {
+        public required string Id { get; set; }
+        public double CenterX { get; set; }
+        public double CenterY { get; set; }
+        public required string FullName { get; set; }
+        public required string Lifespan { get; set; }
+    }
+
+    private sealed class LineSegment
+    {
+        public double X1 { get; set; }
+        public double Y1 { get; set; }
+        public double X2 { get; set; }
+        public double Y2 { get; set; }
+    }
+}

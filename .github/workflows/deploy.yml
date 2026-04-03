@@ -1,0 +1,46 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Publish
+        run: dotnet publish Koreny/Koreny.csproj -c Release -o publish
+
+      - name: Fix permissions
+        run: chmod -R 755 publish/wwwroot
+
+      - name: Find publish output
+        run: find publish -name "*.js" | grep blazor
+
+      - name: Find output structure
+        run: find publish -type f -name "*.js" | head -20
+
+      - name: Fix index.html
+        run: |
+          sed -i 's|<base href="/" />|<base href="/Koreny-PoC/" />|g' publish/wwwroot/Koreny-PoC/index.html
+          BLAZOR_JS=$(ls publish/wwwroot/Koreny-PoC/_framework/blazor.webassembly.*.js | xargs basename)
+          sed -i "s|blazor.webassembly#\[\.{fingerprint}\]\.js|_framework/${BLAZOR_JS}|g" publish/wwwroot/Koreny-PoC/index.html
+
+      - name: Add .nojekyll
+        run: touch publish/wwwroot/.nojekyll
+
+      - name: Deploy
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: publish/wwwroot/Koreny-PoC

@@ -1,0 +1,482 @@
+@using System.Text
+@using Koreny.Models
+
+@* Two-pass layout: generations then rows; each person drawn once. *@
+
+@code {
+    public const double NODE_WIDTH = 160;
+    public const double NODE_HEIGHT = 56;
+    public const double H_GAP = 24;
+    public const double V_GAP = 80;
+
+    private const double Padding = 24;
+    private const double NameLineY = 22;
+    private const double LifespanLineY = 42;
+    private const int MaxNameChars = 26;
+
+    private static double RowPitch => NODE_HEIGHT + V_GAP;
+
+    [Parameter]
+    public GedcomDocument? Document { get; set; }
+
+    public string RenderToSvg()
+    {
+        return RenderToSvg(Document);
+    }
+
+    public static string RenderToSvg(GedcomDocument? document)
+    {
+        if (document is null || document.Individuals.Count == 0)
+        {
+            return EmptySvg("No individuals.");
+        }
+
+        var childIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var f in document.Families)
+        {
+            foreach (var c in f.ChildrenIds)
+            {
+                childIds.Add(c);
+            }
+        }
+
+        var gen = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var ind in document.Individuals)
+        {
+            if (!childIds.Contains(ind.Id))
+            {
+                gen[ind.Id] = 0;
+            }
+        }
+
+        if (gen.Count == 0)
+        {
+            return EmptySvg("No root persons (everyone is a child).");
+        }
+
+        PropagateGenerations(document, gen);
+
+        foreach (var ind in document.Individuals)
+        {
+            if (!gen.ContainsKey(ind.Id))
+            {
+                gen[ind.Id] = 0;
+            }
+        }
+
+        var maxGen = gen.Values.Max();
+        var rowOrders = new Dictionary<int, List<string>>();
+        var maxRowWidth = 0.0;
+        for (var g = 0; g <= maxGen; g++)
+        {
+            var order = OrderRow(g, document, gen);
+            rowOrders[g] = order;
+            var n = order.Count;
+            var rw = n * NODE_WIDTH + Math.Max(0, n - 1) * H_GAP;
+            maxRowWidth = Math.Max(maxRowWidth, rw);
+        }
+
+        var totalW = Padding + maxRowWidth + Padding;
+        var totalH = Math.Max(RowPitch, (maxGen + 1) * RowPitch);
+
+        var xCenter = new Dictionary<string, double>(StringComparer.Ordinal);
+        for (var g = 0; g <= maxGen; g++)
+        {
+            if (!rowOrders.TryGetValue(g, out var order))
+            {
+                continue;
+            }
+
+            var n = order.Count;
+            var rowW = n * NODE_WIDTH + Math.Max(0, n - 1) * H_GAP;
+            var startLeft = Padding + (maxRowWidth - rowW) * 0.5;
+            for (var i = 0; i < n; i++)
+            {
+                var cx = startLeft + NODE_WIDTH * 0.5 + i * (NODE_WIDTH + H_GAP);
+                xCenter[order[i]] = cx;
+            }
+        }
+
+        var boxes = new List<PersonBox>();
+        foreach (var kv in gen)
+        {
+            var id = kv.Key;
+            var g = kv.Value;
+            if (!xCenter.TryGetValue(id, out var cx))
+            {
+                continue;
+            }
+
+            boxes.Add(MakeBox(document, id, cx, g * RowPitch));
+        }
+
+        var segments = new List<LineSeg>();
+        foreach (var f in document.Families)
+        {
+            AddFamilyConnectors(f, gen, xCenter, segments);
+        }
+
+        return BuildSvgXml(totalW, totalH, segments, boxes);
+    }
+
+    /// <summary>Relax until children inherit max(parent generation)+1 (multiple paths take the larger generation).</summary>
+    private static void PropagateGenerations(GedcomDocument document, Dictionary<string, int> gen)
+    {
+        var changed = true;
+        var guard = 0;
+        while (changed && guard++ < document.Individuals.Count + document.Families.Count + 10)
+        {
+            changed = false;
+            foreach (var fam in document.Families)
+            {
+                var pg = -1;
+                if (!string.IsNullOrEmpty(fam.HusbandId) && gen.TryGetValue(fam.HusbandId, out var gh))
+                {
+                    pg = Math.Max(pg, gh);
+                }
+
+                if (!string.IsNullOrEmpty(fam.WifeId) && gen.TryGetValue(fam.WifeId, out var gw))
+                {
+                    pg = Math.Max(pg, gw);
+                }
+
+                if (pg < 0)
+                {
+                    continue;
+                }
+
+                foreach (var c in fam.ChildrenIds)
+                {
+                    var ng = pg + 1;
+                    if (!gen.TryGetValue(c, out var old) || old < ng)
+                    {
+                        gen[c] = ng;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>Start sorted by id, then pull each wife immediately right of husband so pairs from GEDCOM sit adjacent.</summary>
+    private static List<string> OrderRow(int g, GedcomDocument doc, Dictionary<string, int> gen)
+    {
+        var atG = gen.Where(kv => kv.Value == g).Select(kv => kv.Key).ToList();
+        if (atG.Count == 0)
+        {
+            return new List<string>();
+        }
+
+        var ids = atG.OrderBy(x => x, StringComparer.Ordinal).ToList();
+        var pairs = new List<(string H, string W)>();
+        foreach (var f in doc.Families.OrderBy(x => x.Id, StringComparer.Ordinal))
+        {
+            if (string.IsNullOrEmpty(f.HusbandId) || string.IsNullOrEmpty(f.WifeId))
+            {
+                continue;
+            }
+
+            if (gen.GetValueOrDefault(f.HusbandId) != g || gen.GetValueOrDefault(f.WifeId) != g)
+            {
+                continue;
+            }
+
+            pairs.Add((f.HusbandId, f.WifeId));
+        }
+
+        var maxIter = ids.Count * pairs.Count + 20;
+        for (var iter = 0; iter < maxIter; iter++)
+        {
+            var moved = false;
+            foreach (var (h, w) in pairs)
+            {
+                var ih = ids.IndexOf(h);
+                var iw = ids.IndexOf(w);
+                if (ih < 0 || iw < 0)
+                {
+                    continue;
+                }
+
+                if (iw == ih + 1)
+                {
+                    continue;
+                }
+
+                ids.Remove(w);
+                ih = ids.IndexOf(h);
+                ids.Insert(ih + 1, w);
+                moved = true;
+            }
+
+            if (!moved)
+            {
+                break;
+            }
+        }
+
+        return ids;
+    }
+
+    private static void AddFamilyConnectors(
+        GedcomFamily f,
+        Dictionary<string, int> gen,
+        Dictionary<string, double> xCenter,
+        List<LineSeg> segments)
+    {
+        var kids = f.ChildrenIds.Where(c => gen.ContainsKey(c) && xCenter.ContainsKey(c)).ToList();
+        if (kids.Count == 0)
+        {
+            return;
+        }
+
+        var pgH = !string.IsNullOrEmpty(f.HusbandId) && gen.TryGetValue(f.HusbandId!, out var gh) ? gh : (int?)null;
+        var pgW = !string.IsNullOrEmpty(f.WifeId) && gen.TryGetValue(f.WifeId!, out var gw) ? gw : (int?)null;
+
+        var h = f.HusbandId;
+        var w = f.WifeId;
+
+        if (!string.IsNullOrEmpty(h) && !string.IsNullOrEmpty(w) && pgH == pgW && pgH.HasValue
+            && xCenter.ContainsKey(h) && xCenter.ContainsKey(w))
+        {
+            var g = pgH.Value;
+            var cxH = xCenter[h];
+            var cxW = xCenter[w];
+            var y = g * RowPitch;
+            var rowMidY = y + NODE_HEIGHT * 0.5;
+            var hRight = cxH + NODE_WIDTH * 0.5;
+            var wLeft = cxW - NODE_WIDTH * 0.5;
+            segments.Add(new LineSeg { X1 = hRight, Y1 = rowMidY, X2 = wLeft, Y2 = rowMidY });
+
+            var coupleMidX = (hRight + wLeft) * 0.5;
+            var childTopY = (g + 1) * RowPitch;
+            var coupleForkY = rowMidY + (childTopY - rowMidY) * 0.5;
+
+            segments.Add(new LineSeg { X1 = coupleMidX, Y1 = rowMidY, X2 = coupleMidX, Y2 = coupleForkY });
+
+            if (kids.Count == 1)
+            {
+                var ccx = xCenter[kids[0]];
+                if (Math.Abs(ccx - coupleMidX) > 0.01)
+                {
+                    segments.Add(new LineSeg { X1 = coupleMidX, Y1 = coupleForkY, X2 = ccx, Y2 = coupleForkY });
+                }
+
+                segments.Add(new LineSeg { X1 = ccx, Y1 = coupleForkY, X2 = ccx, Y2 = childTopY });
+            }
+            else
+            {
+                var xs = kids.Select(c => xCenter[c]).ToList();
+                var minX = xs.Min();
+                var maxX = xs.Max();
+                segments.Add(new LineSeg { X1 = minX, Y1 = coupleForkY, X2 = maxX, Y2 = coupleForkY });
+                foreach (var c in kids)
+                {
+                    var x = xCenter[c];
+                    segments.Add(new LineSeg { X1 = x, Y1 = coupleForkY, X2 = x, Y2 = childTopY });
+                }
+            }
+
+            return;
+        }
+
+        string? parent = null;
+        int? pg = null;
+        if (!string.IsNullOrEmpty(h) && xCenter.ContainsKey(h) && pgH.HasValue)
+        {
+            parent = h;
+            pg = pgH;
+        }
+        else if (!string.IsNullOrEmpty(w) && xCenter.ContainsKey(w) && pgW.HasValue)
+        {
+            parent = w;
+            pg = pgW;
+        }
+        else if (!string.IsNullOrEmpty(h) && xCenter.ContainsKey(h))
+        {
+            parent = h;
+            pg = gen.GetValueOrDefault(h);
+        }
+        else if (!string.IsNullOrEmpty(w) && xCenter.ContainsKey(w))
+        {
+            parent = w;
+            pg = gen.GetValueOrDefault(w);
+        }
+
+        if (parent is null || !pg.HasValue)
+        {
+            return;
+        }
+
+        var cx = xCenter[parent];
+        var py = pg.Value * RowPitch;
+        var bottomY = py + NODE_HEIGHT;
+        var cTop = (pg.Value + 1) * RowPitch;
+        var forkY = bottomY + (cTop - bottomY) * 0.5;
+
+        segments.Add(new LineSeg { X1 = cx, Y1 = bottomY, X2 = cx, Y2 = forkY });
+
+        if (kids.Count == 1)
+        {
+            var ccx = xCenter[kids[0]];
+            if (Math.Abs(ccx - cx) > 0.01)
+            {
+                segments.Add(new LineSeg { X1 = cx, Y1 = forkY, X2 = ccx, Y2 = forkY });
+            }
+
+            segments.Add(new LineSeg { X1 = ccx, Y1 = forkY, X2 = ccx, Y2 = cTop });
+        }
+        else
+        {
+            var xs = kids.Select(c => xCenter[c]).ToList();
+            var minX = xs.Min();
+            var maxX = xs.Max();
+            var minSeg = Math.Min(cx, minX);
+            var maxSeg = Math.Max(cx, maxX);
+            segments.Add(new LineSeg { X1 = minSeg, Y1 = forkY, X2 = maxSeg, Y2 = forkY });
+            foreach (var c in kids)
+            {
+                var x = xCenter[c];
+                segments.Add(new LineSeg { X1 = x, Y1 = forkY, X2 = x, Y2 = cTop });
+            }
+        }
+    }
+
+    private static string N(double v) => v.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    private static string EmptySvg(string message)
+    {
+        var e = SvgEscape(message);
+        return $"""<svg xmlns="http://www.w3.org/2000/svg" width="320" height="80" viewBox="0 0 320 80"><text x="160" y="44" text-anchor="middle" font-size="13" fill="#333">{e}</text></svg>""";
+    }
+
+    private static string BuildSvgXml(double width, double height, List<LineSeg> segments, List<PersonBox> boxes)
+    {
+        var sb = new StringBuilder();
+        sb.Append($"""<svg xmlns="http://www.w3.org/2000/svg" width="{N(width)}" height="{N(height)}" viewBox="0 0 {N(width)} {N(height)}">""");
+        sb.Append($"<rect x=\"0\" y=\"0\" width=\"{N(width)}\" height=\"{N(height)}\" fill=\"white\" />");
+        sb.Append("""<g stroke="#2a2a2a" stroke-width="1.5" fill="none">""");
+        foreach (var seg in segments)
+        {
+            sb.Append($"<line x1=\"{N(seg.X1)}\" y1=\"{N(seg.Y1)}\" x2=\"{N(seg.X2)}\" y2=\"{N(seg.Y2)}\" />");
+        }
+
+        sb.Append("</g><g>");
+        foreach (var box in boxes)
+        {
+            var left = box.CenterX - NODE_WIDTH * 0.5;
+            var top = box.Y;
+            sb.Append($"<rect x=\"{N(left)}\" y=\"{N(top)}\" width=\"{N(NODE_WIDTH)}\" height=\"{N(NODE_HEIGHT)}\" fill=\"{box.Fill}\" stroke=\"#1a1a1a\" />");
+            sb.Append($"<text x=\"{N(box.CenterX)}\" y=\"{N(top + NameLineY)}\" text-anchor=\"middle\" font-size=\"13\" fill=\"white\">{SvgEscape(box.FullName)}</text>");
+            sb.Append($"<text x=\"{N(box.CenterX)}\" y=\"{N(top + LifespanLineY)}\" text-anchor=\"middle\" font-size=\"13\" fill=\"white\">{SvgEscape(box.Lifespan)}</text>");
+        }
+
+        sb.Append("</g></svg>");
+        return sb.ToString();
+    }
+
+    private static PersonBox MakeBox(GedcomDocument document, string id, double centerX, double y)
+    {
+        var ind = FindIndividual(document, id);
+        var name = ind?.FullName ?? id;
+        return new PersonBox
+        {
+            CenterX = centerX,
+            Y = y,
+            FullName = Truncate(string.IsNullOrWhiteSpace(name) ? id : name),
+            Lifespan = FormatLife(ind),
+            Fill = FillFor(ind),
+        };
+    }
+
+    private static string FillFor(GedcomIndividual? i)
+    {
+        if (i?.Sex == "M")
+        {
+            return "#4A7FB5";
+        }
+
+        if (i?.Sex == "F")
+        {
+            return "#9B2335";
+        }
+
+        return "#888780";
+    }
+
+    private static string FormatLife(GedcomIndividual? i)
+    {
+        if (i is null)
+        {
+            return "?";
+        }
+
+        var b = i.Birth?.ParsedYear;
+        var d = i.Death?.ParsedYear;
+        if (b is not null && d is not null)
+        {
+            return $"{b}–{d}";
+        }
+
+        if (b is not null)
+        {
+            return $"{b}–";
+        }
+
+        if (d is not null)
+        {
+            return $"–{d}";
+        }
+
+        return "?";
+    }
+
+    private static string Truncate(string s)
+    {
+        if (s.Length <= MaxNameChars)
+        {
+            return s;
+        }
+
+        return s[..(MaxNameChars - 1)] + "…";
+    }
+
+    private static string SvgEscape(string s)
+    {
+        return s
+            .Replace("&", "&amp;", StringComparison.Ordinal)
+            .Replace("<", "&lt;", StringComparison.Ordinal)
+            .Replace(">", "&gt;", StringComparison.Ordinal)
+            .Replace("\"", "&quot;", StringComparison.Ordinal)
+            .Replace("'", "&apos;", StringComparison.Ordinal);
+    }
+
+    private static GedcomIndividual? FindIndividual(GedcomDocument doc, string id)
+    {
+        foreach (var i in doc.Individuals)
+        {
+            if (i.Id == id)
+            {
+                return i;
+            }
+        }
+
+        return null;
+    }
+
+    private sealed class PersonBox
+    {
+        public double CenterX { get; init; }
+        public double Y { get; init; }
+        public required string FullName { get; init; }
+        public required string Lifespan { get; init; }
+        public required string Fill { get; init; }
+    }
+
+    private sealed class LineSeg
+    {
+        public double X1 { get; init; }
+        public double Y1 { get; init; }
+        public double X2 { get; init; }
+        public double Y2 { get; init; }
+    }
+}

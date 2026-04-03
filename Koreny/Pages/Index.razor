@@ -1,0 +1,838 @@
+@page "/"
+@using Koreny.Models
+@using Microsoft.JSInterop
+@implements IAsyncDisposable
+@inject GedcomParser Parser
+@inject AppState AppState
+@inject IJSRuntime JSRuntime
+
+<PageTitle>Kořeny</PageTitle>
+
+<main style="width: 100%; max-width: none; margin: 0 auto; padding: 1rem;">
+    <h1>Kořeny</h1>
+
+    @if (!string.IsNullOrEmpty(_loadError))
+    {
+        <p role="alert">@_loadError</p>
+    }
+
+    <div style="display: flex; width: 100%; gap: 1rem; align-items: flex-start;">
+        <div style="flex: 3; min-width: 0;">
+            <div style="display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 0.75rem;">
+                <button type="button" @onclick="StartNewPerson">Nová osoba</button>
+                <button type="button" @onclick="StartNewFamily">Nová rodina</button>
+                <label style="margin: 0;">
+                    Načíst GEDCOM
+                    <InputFile OnChange="OnFileSelectedAsync" accept=".ged" />
+                </label>
+                <button type="button" @onclick="ExportGedcomAsync">Exportovat GEDCOM</button>
+                @if (_doc is not null && !string.IsNullOrEmpty(_rootPersonId))
+                {
+                    <button type="button" @onclick="OpenFullTreeOverlay">Celý strom</button>
+                }
+                @if (_doc is not null)
+                {
+                    <button type="button" @onclick="OpenFullGraphOverlay">Celý graf</button>
+                }
+                <span role="status">Osoby: @(_doc?.Individuals.Count ?? 0), rodiny: @(_doc?.Families.Count ?? 0)</span>
+                @if (_doc is not null && _doc.Families.Count > 0)
+                {
+                    <span>
+                        <label for="fam-pick" style="margin-left: 0.5rem;">Upravit rodinu</label>
+                        <select id="fam-pick" @bind="_pickFamilyId" style="margin-left: 0.25rem;">
+                            @foreach (var f in _doc.Families)
+                            {
+                                <option value="@f.Id">@f.Id</option>
+                            }
+                        </select>
+                        <button type="button" @onclick="OpenPickedFamilyForEdit">Otevřít</button>
+                    </span>
+                }
+            </div>
+
+            @if (_doc is not null)
+            {
+                <HourglassTree Document="@_doc"
+                               RootPersonId="@_rootPersonId"
+                               OnPersonSelected="OnTreePersonSelected"
+                               OnPersonDoubleClicked="OnTreePersonDoubleClicked" />
+            }
+        </div>
+
+        <aside style="flex: 2; min-width: 0; border-left: 1px solid #ccc; padding-left: 1rem; display: flex; flex-direction: column; min-height: 0;">
+            @switch (_panel)
+            {
+                case PanelView.None:
+                    <p style="margin-top: 0;">Vyberte osobu nebo přidejte novou.</p>
+                    <div style="flex: 1; min-height: 0; overflow: auto; max-height: calc(100vh - 12rem);">
+                        @if (_doc is not null)
+                        {
+                            @foreach (var p in GetIndividualsSorted())
+                            {
+                                var rowId = p.Id;
+                                <button type="button"
+                                        @onclick="@(() => OnPersonListRowClicked(rowId))"
+                                        style="display: block; width: 100%; text-align: left; margin-bottom: 0.35rem; cursor: pointer;">
+                                    @p.FullName — @FormatLifespanYears(p)
+                                </button>
+                            }
+                        }
+                    </div>
+                    break;
+                case PanelView.Person:
+                    <h2 style="margin-top: 0;">@(_personIsNew ? "Nová osoba" : "Upravit osobu")</h2>
+                    <div style="display: grid; gap: 0.5rem;">
+                        <label>Jméno <input @bind="_pGiven" /></label>
+                        <label>Příjmení <input @bind="_pSurname" /></label>
+                        <label>
+                            Pohlaví
+                            <select @bind="_pSexCode">
+                                <option value="0">Neznámé</option>
+                                <option value="1">Muž</option>
+                                <option value="2">Žena</option>
+                            </select>
+                        </label>
+                        <label>Rok narození <input type="number" @bind="_pBirthYear" /></label>
+                        <label>Místo narození <input @bind="_pBirthPlace" /></label>
+                        <label>Rok úmrtí <input type="number" @bind="_pDeathYear" /></label>
+                        <label>Místo úmrtí <input @bind="_pDeathPlace" /></label>
+                        <label>Poznámka <input @bind="_pNote" /></label>
+                    </div>
+                    <p style="margin-top: 0.75rem;">
+                        <button type="button" @onclick="SavePerson">Uložit</button>
+                        @if (!_personIsNew)
+                        {
+                            <button type="button" @onclick="DeletePerson">Smazat</button>
+                        }
+                        <button type="button" @onclick="CancelPanel">Zrušit</button>
+                    </p>
+                    break;
+                case PanelView.Family:
+                    <h2 style="margin-top: 0;">@(_familyIsNew ? "Nová rodina" : "Upravit rodinu")</h2>
+                    @if (_doc is null || _doc.Individuals.Count == 0)
+                    {
+                        <p>Nejdříve přidejte alespoň jednu osobu.</p>
+                    }
+                    else
+                    {
+                        <div style="display: grid; gap: 0.5rem;">
+                            <label>
+                                Manžel
+                                <select @bind="_fHusbandId">
+                                    <option value="">(žádný)</option>
+                                    @foreach (var p in _doc.Individuals)
+                                    {
+                                        <option value="@p.Id">@p.FullName (@p.Id)</option>
+                                    }
+                                </select>
+                            </label>
+                            <label>
+                                Manželka
+                                <select @bind="_fWifeId">
+                                    <option value="">(žádná)</option>
+                                    @foreach (var p in _doc.Individuals)
+                                    {
+                                        <option value="@p.Id">@p.FullName (@p.Id)</option>
+                                    }
+                                </select>
+                            </label>
+                            <fieldset>
+                                <legend>Děti</legend>
+                                @foreach (var c in _doc.Individuals)
+                                {
+                                    var cid = c.Id;
+                                    <label style="display: block;">
+                                        <input type="checkbox" checked="@IsFamilyChildChecked(cid)" @onchange="@(e => OnFamilyChildToggle(cid, e))" />
+                                        @c.FullName (@cid)
+                                    </label>
+                                }
+                            </fieldset>
+                            <label>Rok sňatku <input type="number" @bind="_fMarriageYear" /></label>
+                            <label>Místo sňatku <input @bind="_fMarriagePlace" /></label>
+                        </div>
+                        <p style="margin-top: 0.75rem;">
+                            <button type="button" @onclick="SaveFamily">Uložit</button>
+                            @if (!_familyIsNew)
+                            {
+                                <button type="button" @onclick="DeleteFamily">Smazat</button>
+                            }
+                            <button type="button" @onclick="CancelPanel">Zrušit</button>
+                        </p>
+                    }
+                    break;
+            }
+        </aside>
+    </div>
+</main>
+
+@if (_showFullTreeOverlay && !string.IsNullOrEmpty(_fullTreeSvgDataUri))
+{
+    <div style="position: fixed; inset: 0; z-index: 1000; background: #fff; outline: none;"
+         tabindex="-1"
+         @ref="_fullTreeOverlayRef"
+         @onkeydown="OnFullTreeKeyDown">
+        <div style="position: absolute; top: 0.5rem; right: 0.5rem; z-index: 1001; display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; justify-content: flex-end;">
+            <button type="button" @onclick="DownloadFullTreeSvgAsync">Stáhnout SVG</button>
+            <button type="button" @onclick="PrintFullTreeSvgAsync">Tisk</button>
+            <button type="button"
+                    @onclick="CloseFullTreeOverlay"
+                    aria-label="Zavřít">×</button>
+        </div>
+        <div style="position: absolute; inset: 0; overflow: auto; display: flex; justify-content: center; align-items: flex-start; padding: 2.5rem 0.75rem 0.75rem 0.75rem;">
+            <img src="@_fullTreeSvgDataUri" alt="Potomkovský strom" style="display: block; max-width: none;" />
+        </div>
+    </div>
+}
+
+@if (_showFullGraphOverlay && !string.IsNullOrEmpty(_fullGraphSvgDataUri))
+{
+    <div style="position: fixed; inset: 0; z-index: 1000; background: #fff; outline: none;"
+         tabindex="-1"
+         @ref="_fullGraphOverlayRef"
+         @onkeydown="OnFullGraphKeyDown">
+        <div style="position: absolute; top: 0.5rem; right: 0.5rem; z-index: 1001; display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; justify-content: flex-end;">
+            <button type="button" @onclick="DownloadFullGraphSvgAsync">Stáhnout SVG</button>
+            <button type="button" @onclick="PrintFullGraphSvgAsync">Tisk</button>
+            <button type="button"
+                    @onclick="CloseFullGraphOverlay"
+                    aria-label="Zavřít">×</button>
+        </div>
+        <div style="position: absolute; inset: 0; overflow: auto; display: flex; justify-content: center; align-items: flex-start; padding: 2.5rem 0.75rem 0.75rem 0.75rem;">
+            <img src="@_fullGraphSvgDataUri" alt="Rodinný graf" style="display: block; max-width: none;" />
+        </div>
+    </div>
+}
+
+@code {
+    private GedcomDocument? _doc;
+    private string? _loadError;
+    private string? _rootPersonId;
+
+    private PanelView _panel = PanelView.None;
+    private bool _personIsNew;
+    private bool _familyIsNew;
+    private string? _editPersonId;
+    private string? _editFamilyId;
+
+    private string _pGiven = string.Empty;
+    private string _pSurname = string.Empty;
+    private int _pSexCode;
+    private int? _pBirthYear;
+    private string _pBirthPlace = string.Empty;
+    private int? _pDeathYear;
+    private string _pDeathPlace = string.Empty;
+    private string _pNote = string.Empty;
+
+    private string _fHusbandId = string.Empty;
+    private string _fWifeId = string.Empty;
+    private int? _fMarriageYear;
+    private string _fMarriagePlace = string.Empty;
+    private readonly Dictionary<string, bool> _fChildSel = new(StringComparer.Ordinal);
+    private string _pickFamilyId = string.Empty;
+
+    private bool _showFullTreeOverlay;
+    private string? _fullTreeSvgMarkup;
+    private string? _fullTreeSvgDataUri;
+    private ElementReference _fullTreeOverlayRef;
+    private bool _pendingFullTreeOverlayFocus;
+
+    private bool _showFullGraphOverlay;
+    private string? _fullGraphSvgMarkup;
+    private string? _fullGraphSvgDataUri;
+    private ElementReference _fullGraphOverlayRef;
+    private bool _pendingFullGraphOverlayFocus;
+
+    private IJSObjectReference? _exportModule;
+
+    private enum PanelView
+    {
+        None,
+        Person,
+        Family,
+    }
+
+    protected override void OnInitialized()
+    {
+        AppState.Document ??= new GedcomDocument();
+        _doc = AppState.Document;
+        EnsureRootPersonId();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (_pendingFullTreeOverlayFocus && _showFullTreeOverlay)
+        {
+            _pendingFullTreeOverlayFocus = false;
+            await _fullTreeOverlayRef.FocusAsync();
+        }
+
+        if (_pendingFullGraphOverlayFocus && _showFullGraphOverlay)
+        {
+            _pendingFullGraphOverlayFocus = false;
+            await _fullGraphOverlayRef.FocusAsync();
+        }
+    }
+
+    private void OpenFullTreeOverlay()
+    {
+        if (_doc is null || string.IsNullOrEmpty(_rootPersonId))
+        {
+            return;
+        }
+
+        var svg = DescendantTree.RenderToSvg(_doc, _rootPersonId);
+        _fullTreeSvgMarkup = svg;
+        _fullTreeSvgDataUri = "data:image/svg+xml;base64," + Convert.ToBase64String(Encoding.UTF8.GetBytes(svg));
+        _showFullTreeOverlay = true;
+        _pendingFullTreeOverlayFocus = true;
+    }
+
+    private void CloseFullTreeOverlay()
+    {
+        _showFullTreeOverlay = false;
+        _fullTreeSvgMarkup = null;
+        _fullTreeSvgDataUri = null;
+    }
+
+    private async Task DownloadFullTreeSvgAsync()
+    {
+        if (string.IsNullOrEmpty(_fullTreeSvgMarkup))
+        {
+            return;
+        }
+
+        var module = await GetExportModuleAsync();
+        await module.InvokeVoidAsync("downloadSvg", _fullTreeSvgMarkup, "koreny-export.svg");
+    }
+
+    private async Task PrintFullTreeSvgAsync()
+    {
+        if (string.IsNullOrEmpty(_fullTreeSvgMarkup))
+        {
+            return;
+        }
+
+        var module = await GetExportModuleAsync();
+        await module.InvokeVoidAsync("printSvg", _fullTreeSvgMarkup);
+    }
+
+    private void OnFullTreeKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape")
+        {
+            CloseFullTreeOverlay();
+        }
+    }
+
+    private void OpenFullGraphOverlay()
+    {
+        if (_doc is null)
+        {
+            return;
+        }
+
+        var svg = FullGraph.RenderToSvg(_doc);
+        _fullGraphSvgMarkup = svg;
+        _fullGraphSvgDataUri = "data:image/svg+xml;base64," + Convert.ToBase64String(Encoding.UTF8.GetBytes(svg));
+        _showFullGraphOverlay = true;
+        _pendingFullGraphOverlayFocus = true;
+    }
+
+    private void CloseFullGraphOverlay()
+    {
+        _showFullGraphOverlay = false;
+        _fullGraphSvgMarkup = null;
+        _fullGraphSvgDataUri = null;
+    }
+
+    private async Task DownloadFullGraphSvgAsync()
+    {
+        if (string.IsNullOrEmpty(_fullGraphSvgMarkup))
+        {
+            return;
+        }
+
+        var module = await GetExportModuleAsync();
+        await module.InvokeVoidAsync("downloadSvg", _fullGraphSvgMarkup, "koreny-export.svg");
+    }
+
+    private async Task PrintFullGraphSvgAsync()
+    {
+        if (string.IsNullOrEmpty(_fullGraphSvgMarkup))
+        {
+            return;
+        }
+
+        var module = await GetExportModuleAsync();
+        await module.InvokeVoidAsync("printSvg", _fullGraphSvgMarkup);
+    }
+
+    private void OnFullGraphKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape")
+        {
+            CloseFullGraphOverlay();
+        }
+    }
+
+    private void EnsureRootPersonId()
+    {
+        _doc = AppState.Document;
+        if (_doc is null || _doc.Individuals.Count == 0)
+        {
+            _rootPersonId = null;
+            return;
+        }
+
+        if (string.IsNullOrEmpty(_rootPersonId) || _doc.Individuals.All(x => x.Id != _rootPersonId))
+        {
+            _rootPersonId = _doc.Individuals[0].Id;
+        }
+    }
+
+    private Task OnTreePersonSelected(string id)
+    {
+        _rootPersonId = id;
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+
+    private Task OnTreePersonDoubleClicked(string id)
+    {
+        _rootPersonId = id;
+        OpenPersonForEdit(id);
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+
+    private void OnPersonListRowClicked(string id)
+    {
+        _rootPersonId = id;
+        OpenPersonForEdit(id);
+        StateHasChanged();
+    }
+
+    private IEnumerable<GedcomIndividual> GetIndividualsSorted()
+    {
+        if (_doc is null)
+        {
+            return Enumerable.Empty<GedcomIndividual>();
+        }
+
+        return _doc.Individuals
+            .OrderBy(p => p.Name?.Surname ?? "", StringComparer.OrdinalIgnoreCase)
+            .ThenBy(p => p.Name?.GivenName ?? "", StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static string FormatLifespanYears(GedcomIndividual i)
+    {
+        var b = i.Birth?.ParsedYear;
+        var d = i.Death?.ParsedYear;
+        if (b is not null && d is not null)
+        {
+            return $"{b}–{d}";
+        }
+
+        if (b is not null)
+        {
+            return $"{b}–";
+        }
+
+        if (d is not null)
+        {
+            return $"–{d}";
+        }
+
+        return "?";
+    }
+
+    private void StartNewPerson()
+    {
+        if (_doc is null)
+        {
+            return;
+        }
+
+        _panel = PanelView.Person;
+        _personIsNew = true;
+        _editPersonId = null;
+        ClearPersonForm();
+    }
+
+    private void OpenPersonForEdit(string id)
+    {
+        if (_doc is null)
+        {
+            return;
+        }
+
+        _panel = PanelView.Person;
+        _personIsNew = false;
+        _editPersonId = id;
+        var p = _doc.Individuals.First(x => x.Id == id);
+        _pGiven = p.Name?.GivenName ?? string.Empty;
+        _pSurname = p.Name?.Surname ?? string.Empty;
+        _pSexCode = p.Sex switch
+        {
+            "M" => 1,
+            "F" => 2,
+            _ => 0,
+        };
+        _pBirthYear = p.Birth?.ParsedYear;
+        _pBirthPlace = p.Birth?.Place ?? string.Empty;
+        _pDeathYear = p.Death?.ParsedYear;
+        _pDeathPlace = p.Death?.Place ?? string.Empty;
+        _pNote = p.Notes.FirstOrDefault() ?? string.Empty;
+    }
+
+    private void ClearPersonForm()
+    {
+        _pGiven = string.Empty;
+        _pSurname = string.Empty;
+        _pSexCode = 0;
+        _pBirthYear = null;
+        _pBirthPlace = string.Empty;
+        _pDeathYear = null;
+        _pDeathPlace = string.Empty;
+        _pNote = string.Empty;
+    }
+
+    private void SavePerson()
+    {
+        if (_doc is null)
+        {
+            return;
+        }
+
+        GedcomIndividual ind;
+        if (_personIsNew)
+        {
+            ind = new GedcomIndividual { Id = NextIndividualId() };
+            _doc.Individuals.Add(ind);
+        }
+        else
+        {
+            if (string.IsNullOrEmpty(_editPersonId))
+            {
+                return;
+            }
+
+            ind = _doc.Individuals.First(x => x.Id == _editPersonId);
+        }
+
+        ApplyPersonForm(ind);
+        _panel = PanelView.None;
+        EnsureRootPersonId();
+        StateHasChanged();
+    }
+
+    private void ApplyPersonForm(GedcomIndividual ind)
+    {
+        var sur = _pSurname.Trim();
+        var giv = _pGiven.Trim();
+        ind.Name = new GedcomName
+        {
+            GivenName = string.IsNullOrEmpty(giv) ? null : giv,
+            Surname = string.IsNullOrEmpty(sur) ? null : sur,
+            Raw = $"/{sur}/ {giv}".Trim(),
+        };
+        ind.Sex = _pSexCode switch
+        {
+            1 => "M",
+            2 => "F",
+            _ => null,
+        };
+
+        if (_pBirthYear is not null || !string.IsNullOrWhiteSpace(_pBirthPlace))
+        {
+            ind.Birth = new GedcomEvent
+            {
+                Date = _pBirthYear?.ToString(),
+                Place = string.IsNullOrWhiteSpace(_pBirthPlace) ? null : _pBirthPlace.Trim(),
+            };
+        }
+        else
+        {
+            ind.Birth = null;
+        }
+
+        if (_pDeathYear is not null || !string.IsNullOrWhiteSpace(_pDeathPlace))
+        {
+            ind.Death = new GedcomEvent
+            {
+                Date = _pDeathYear?.ToString(),
+                Place = string.IsNullOrWhiteSpace(_pDeathPlace) ? null : _pDeathPlace.Trim(),
+            };
+        }
+        else
+        {
+            ind.Death = null;
+        }
+
+        ind.Notes.Clear();
+        if (!string.IsNullOrWhiteSpace(_pNote))
+        {
+            ind.Notes.Add(_pNote.Trim());
+        }
+    }
+
+    private void DeletePerson()
+    {
+        if (_doc is null || _personIsNew || string.IsNullOrEmpty(_editPersonId))
+        {
+            return;
+        }
+
+        StripIndividualFromFamilies(_editPersonId);
+        _doc.Individuals.RemoveAll(x => x.Id == _editPersonId);
+        if (_rootPersonId == _editPersonId)
+        {
+            _rootPersonId = null;
+        }
+
+        _panel = PanelView.None;
+        EnsureRootPersonId();
+        StateHasChanged();
+    }
+
+    private static void StripIndividualFromFamilies(string personId, GedcomDocument doc)
+    {
+        foreach (var f in doc.Families)
+        {
+            if (f.HusbandId == personId)
+            {
+                f.HusbandId = null;
+            }
+
+            if (f.WifeId == personId)
+            {
+                f.WifeId = null;
+            }
+
+            f.ChildrenIds.RemoveAll(c => c == personId);
+        }
+    }
+
+    private void StripIndividualFromFamilies(string personId) =>
+        StripIndividualFromFamilies(personId, _doc!);
+
+    private void StartNewFamily()
+    {
+        _panel = PanelView.Family;
+        _familyIsNew = true;
+        _editFamilyId = null;
+        ClearFamilyForm();
+    }
+
+    private void OpenPickedFamilyForEdit()
+    {
+        if (string.IsNullOrEmpty(_pickFamilyId))
+        {
+            return;
+        }
+
+        OpenFamilyForEdit(_pickFamilyId);
+        StateHasChanged();
+    }
+
+    private void OpenFamilyForEdit(string id)
+    {
+        if (_doc is null)
+        {
+            return;
+        }
+
+        var f = _doc.Families.First(x => x.Id == id);
+        _panel = PanelView.Family;
+        _familyIsNew = false;
+        _editFamilyId = id;
+        _pickFamilyId = id;
+        _fHusbandId = f.HusbandId ?? string.Empty;
+        _fWifeId = f.WifeId ?? string.Empty;
+        _fMarriageYear = f.Marriage?.ParsedYear;
+        _fMarriagePlace = f.Marriage?.Place ?? string.Empty;
+        _fChildSel.Clear();
+        foreach (var p in _doc.Individuals)
+        {
+            _fChildSel[p.Id] = f.ChildrenIds.Contains(p.Id);
+        }
+    }
+
+    private void ClearFamilyForm()
+    {
+        _fHusbandId = string.Empty;
+        _fWifeId = string.Empty;
+        _fMarriageYear = null;
+        _fMarriagePlace = string.Empty;
+        _fChildSel.Clear();
+        if (_doc is not null)
+        {
+            foreach (var p in _doc.Individuals)
+            {
+                _fChildSel[p.Id] = false;
+            }
+        }
+    }
+
+    private bool IsFamilyChildChecked(string id) =>
+        _fChildSel.TryGetValue(id, out var v) && v;
+
+    private void OnFamilyChildToggle(string id, ChangeEventArgs e)
+    {
+        if (e.Value is bool on)
+        {
+            _fChildSel[id] = on;
+        }
+    }
+
+    private void SaveFamily()
+    {
+        if (_doc is null || _doc.Individuals.Count == 0)
+        {
+            return;
+        }
+
+        GedcomFamily fam;
+        if (_familyIsNew)
+        {
+            fam = new GedcomFamily { Id = NextFamilyId() };
+            _doc.Families.Add(fam);
+        }
+        else
+        {
+            if (string.IsNullOrEmpty(_editFamilyId))
+            {
+                return;
+            }
+
+            fam = _doc.Families.First(x => x.Id == _editFamilyId);
+        }
+
+        fam.HusbandId = string.IsNullOrEmpty(_fHusbandId) ? null : _fHusbandId;
+        fam.WifeId = string.IsNullOrEmpty(_fWifeId) ? null : _fWifeId;
+        fam.ChildrenIds.Clear();
+        foreach (var kv in _fChildSel.Where(kv => kv.Value))
+        {
+            fam.ChildrenIds.Add(kv.Key);
+        }
+
+        if (_fMarriageYear is not null || !string.IsNullOrWhiteSpace(_fMarriagePlace))
+        {
+            fam.Marriage = new GedcomEvent
+            {
+                Date = _fMarriageYear?.ToString(),
+                Place = string.IsNullOrWhiteSpace(_fMarriagePlace) ? null : _fMarriagePlace.Trim(),
+            };
+        }
+        else
+        {
+            fam.Marriage = null;
+        }
+
+        _panel = PanelView.None;
+        StateHasChanged();
+    }
+
+    private void DeleteFamily()
+    {
+        if (_doc is null || _familyIsNew || string.IsNullOrEmpty(_editFamilyId))
+        {
+            return;
+        }
+
+        _doc.Families.RemoveAll(x => x.Id == _editFamilyId);
+        _panel = PanelView.None;
+        StateHasChanged();
+    }
+
+    private void CancelPanel()
+    {
+        _panel = PanelView.None;
+    }
+
+    private string NextIndividualId()
+    {
+        var max = 0;
+        foreach (var i in _doc!.Individuals)
+        {
+            if (i.Id.Length > 1 && i.Id[0] == 'I' && int.TryParse(i.Id.AsSpan(1), out var n))
+            {
+                max = Math.Max(max, n);
+            }
+        }
+
+        return $"I{max + 1}";
+    }
+
+    private string NextFamilyId()
+    {
+        var max = 0;
+        foreach (var f in _doc!.Families)
+        {
+            if (f.Id.Length > 1 && f.Id[0] == 'F' && int.TryParse(f.Id.AsSpan(1), out var n))
+            {
+                max = Math.Max(max, n);
+            }
+        }
+
+        return $"F{max + 1}";
+    }
+
+    private async Task OnFileSelectedAsync(InputFileChangeEventArgs e)
+    {
+        _loadError = null;
+        var file = e.File;
+        if (file is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await using var stream = file.OpenReadStream(maxAllowedSize: 50_000_000);
+            using var reader = new StreamReader(stream, Encoding.UTF8);
+            var text = await reader.ReadToEndAsync();
+            AppState.Document = Parser.Parse(text);
+            _doc = AppState.Document;
+            _panel = PanelView.None;
+            EnsureRootPersonId();
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            _loadError = ex.Message;
+        }
+    }
+
+    private async Task ExportGedcomAsync()
+    {
+        if (_doc is null)
+        {
+            return;
+        }
+
+        var text = GedcomWriter.Write(_doc);
+        var module = await GetExportModuleAsync();
+        await module.InvokeVoidAsync("downloadText", text, "koreny-export.ged", "text/plain;charset=utf-8");
+    }
+
+    private async ValueTask<IJSObjectReference> GetExportModuleAsync()
+    {
+        if (_exportModule is not null)
+        {
+            return _exportModule;
+        }
+
+        _exportModule = await JSRuntime.InvokeAsync<IJSObjectReference>("import", "./js/export.js");
+        return _exportModule;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_exportModule is not null)
+        {
+            await _exportModule.DisposeAsync();
+            _exportModule = null;
+        }
+    }
+}
