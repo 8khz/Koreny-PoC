@@ -69,9 +69,10 @@
                             <div style="display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; flex-shrink: 0;">
                                 <label for="fam-pick" style="margin: 0;">Upravit rodinu:</label>
                                 <select id="fam-pick" @bind="_pickFamilyId" disabled="@(_doc.Families.Count == 0)">
-                                    @foreach (var f in _doc.Families)
+                                    @for (var fi = 0; fi < _doc.Families.Count; fi++)
                                     {
-                                        <option value="@f.Id">@f.Id</option>
+                                        var f = _doc.Families[fi];
+                                        <option value="@f.Id">@FamilyLabel(f, fi + 1)</option>
                                     }
                                 </select>
                                 <button type="button" @onclick="OpenPickedFamilyForEdit" disabled="@(_doc.Families.Count == 0 || string.IsNullOrEmpty(_pickFamilyId))">Otevřít</button>
@@ -443,6 +444,82 @@
         {
             _rootPersonId = _doc.Individuals[0].Id;
         }
+    }
+
+    private string FamilyLabel(GedcomFamily family, int index)
+    {
+        if (_doc is null)
+        {
+            return $"{index}. —";
+        }
+
+        static string PartnerLabel(GedcomIndividual ind)
+        {
+            var g = ind.Name?.GivenName;
+            var s = ind.Name?.Surname;
+            var givenOk = !string.IsNullOrWhiteSpace(g);
+            var surOk = !string.IsNullOrWhiteSpace(s);
+
+            if (!givenOk && !surOk)
+            {
+                return "?";
+            }
+
+            if (!givenOk && surOk)
+            {
+                var sTrim = s!.Trim();
+                return $"? {char.ToUpperInvariant(sTrim[0])}.";
+            }
+
+            if (givenOk && !surOk)
+            {
+                return g!.Trim();
+            }
+
+            var given = g!.Trim();
+            var sTr = s!.Trim();
+            return $"{given} {char.ToUpperInvariant(sTr[0])}.";
+        }
+
+        GedcomIndividual? Find(string? id)
+        {
+            if (string.IsNullOrEmpty(id))
+            {
+                return null;
+            }
+
+            foreach (var i in _doc.Individuals)
+            {
+                if (i.Id == id)
+                {
+                    return i;
+                }
+            }
+
+            return null;
+        }
+
+        var parts = new List<string>();
+        var h = Find(family.HusbandId);
+        if (h is not null)
+        {
+            parts.Add(PartnerLabel(h));
+        }
+
+        var w = Find(family.WifeId);
+        if (w is not null)
+        {
+            parts.Add(PartnerLabel(w));
+        }
+
+        var core = parts.Count switch
+        {
+            0 => "—",
+            1 => parts[0],
+            _ => string.Join(" + ", parts),
+        };
+
+        return $"{index}. {core}";
     }
 
     private Task OnTreePersonSelected(string id)
