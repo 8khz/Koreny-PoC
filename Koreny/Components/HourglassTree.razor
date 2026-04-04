@@ -8,10 +8,7 @@
 }
 else
 {
-    <div style="margin-bottom: 0.75rem;">
-        <button type="button" @onclick="DownloadSvgAsync">Stáhnout SVG</button>
-        <button type="button" @onclick="PrintSvgAsync">Tisk</button>
-    </div>
+    
     <svg width="@_svgWidth" height="@_svgHeight" xmlns="http://www.w3.org/2000/svg" style="display: block; max-width: 100%; height: auto;">
         <g stroke="#666" stroke-width="1" fill="none">
             @foreach (var seg in _segments)
