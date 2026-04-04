@@ -1,7 +1,10 @@
 @using System.Text
 @using Koreny.Models
+@using Koreny.Services
 
-@* Two-pass layout: generations then rows; each person drawn once. *@
+@inject FamilyGraphLayoutService LayoutService
+
+@* Positions from GraphShape Sugiyama via FamilyGraphLayoutService. *@
 
 @code {
     public const double NODE_WIDTH = 160;
@@ -9,28 +12,44 @@
     public const double H_GAP = 24;
     public const double V_GAP = 80;
 
-    private const double Padding = 24;
+    private const double V_CONNECTOR_GAP = V_GAP / 2.0;
+
     private const double NameLineY = 22;
     private const double LifespanLineY = 42;
     private const int MaxNameChars = 26;
-
-    private static double RowPitch => NODE_HEIGHT + V_GAP;
 
     [Parameter]
     public GedcomDocument? Document { get; set; }
 
     public string RenderToSvg()
     {
-        return RenderToSvg(Document);
+        return RenderToSvg(Document, LayoutService);
     }
 
-    public static string RenderToSvg(GedcomDocument? document)
+    public static string RenderToSvg(GedcomDocument? document, FamilyGraphLayoutService layoutService)
     {
         if (document is null || document.Individuals.Count == 0)
         {
             return EmptySvg("No individuals.");
         }
 
+        var raw = layoutService.ComputeLayout(document);
+        if (raw.Count == 0)
+        {
+            return EmptySvg("No layout.");
+        }
+
+        var positions = new Dictionary<string, (double X, double Y)>(StringComparer.Ordinal);
+        foreach (var kv in raw)
+        {
+            positions[kv.Key] = kv.Value;
+        }
+
+        ApplyPartnerSeparation(document, positions);
+        ApplyGenerationOverlapRemoval(positions);
+        RecenterLayoutPositions(positions);
+
+        var gen = new Dictionary<string, int>(StringComparer.Ordinal);
         var childIds = new HashSet<string>(StringComparer.Ordinal);
         foreach (var f in document.Families)
         {
@@ -40,7 +59,6 @@
             }
         }
 
-        var gen = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var ind in document.Individuals)
         {
             if (!childIds.Contains(ind.Id))
@@ -55,7 +73,6 @@
         }
 
         PropagateGenerations(document, gen);
-
         foreach (var ind in document.Individuals)
         {
             if (!gen.ContainsKey(ind.Id))
@@ -64,62 +81,162 @@
             }
         }
 
-        var maxGen = gen.Values.Max();
-        var rowOrders = new Dictionary<int, List<string>>();
-        var maxRowWidth = 0.0;
-        for (var g = 0; g <= maxGen; g++)
-        {
-            var order = OrderRow(g, document, gen);
-            rowOrders[g] = order;
-            var n = order.Count;
-            var rw = n * NODE_WIDTH + Math.Max(0, n - 1) * H_GAP;
-            maxRowWidth = Math.Max(maxRowWidth, rw);
-        }
-
-        var totalW = Padding + maxRowWidth + Padding;
-        var totalH = Math.Max(RowPitch, (maxGen + 1) * RowPitch);
-
-        var xCenter = new Dictionary<string, double>(StringComparer.Ordinal);
-        for (var g = 0; g <= maxGen; g++)
-        {
-            if (!rowOrders.TryGetValue(g, out var order))
-            {
-                continue;
-            }
-
-            var n = order.Count;
-            var rowW = n * NODE_WIDTH + Math.Max(0, n - 1) * H_GAP;
-            var startLeft = Padding + (maxRowWidth - rowW) * 0.5;
-            for (var i = 0; i < n; i++)
-            {
-                var cx = startLeft + NODE_WIDTH * 0.5 + i * (NODE_WIDTH + H_GAP);
-                xCenter[order[i]] = cx;
-            }
-        }
+        var totalW = positions.Values.Max(p => p.X + NODE_WIDTH) + H_GAP;
+        var totalH = positions.Values.Max(p => p.Y + NODE_HEIGHT) + V_GAP;
 
         var boxes = new List<PersonBox>();
-        foreach (var kv in gen)
+        foreach (var ind in document.Individuals)
         {
-            var id = kv.Key;
-            var g = kv.Value;
-            if (!xCenter.TryGetValue(id, out var cx))
+            if (!positions.TryGetValue(ind.Id, out var p))
             {
                 continue;
             }
 
-            boxes.Add(MakeBox(document, id, cx, g * RowPitch));
+            boxes.Add(MakeBox(document, ind.Id, p.X + NODE_WIDTH * 0.5, p.Y));
         }
 
         var segments = new List<LineSeg>();
         foreach (var f in document.Families)
         {
-            AddFamilyConnectors(f, gen, xCenter, segments);
+            AddFamilyConnectors(f, gen, positions, segments);
         }
 
         return BuildSvgXml(totalW, totalH, segments, boxes);
     }
 
-    /// <summary>Relax until children inherit max(parent generation)+1 (multiple paths take the larger generation).</summary>
+    /// <summary>Separate spouses that Sugiyama placed too close; ripple shift keeps global order.</summary>
+    private static void ApplyPartnerSeparation(GedcomDocument document, Dictionary<string, (double X, double Y)> positions)
+    {
+        var minPitch = NODE_WIDTH + H_GAP;
+        foreach (var fam in document.Families.OrderBy(f => f.Id, StringComparer.Ordinal))
+        {
+            var h = fam.HusbandId;
+            var wif = fam.WifeId;
+            if (string.IsNullOrEmpty(h) || string.IsNullOrEmpty(wif))
+            {
+                continue;
+            }
+
+            if (!positions.TryGetValue(h, out var pH) || !positions.TryGetValue(wif, out var pW))
+            {
+                continue;
+            }
+
+            string leftId;
+            string rightId;
+            double oldXLeft;
+            double oldXRight;
+            if (pH.X <= pW.X)
+            {
+                leftId = h;
+                rightId = wif;
+                oldXLeft = pH.X;
+                oldXRight = pW.X;
+            }
+            else
+            {
+                leftId = wif;
+                rightId = h;
+                oldXLeft = pW.X;
+                oldXRight = pH.X;
+            }
+
+            if (oldXRight - oldXLeft >= minPitch - 1e-9)
+            {
+                continue;
+            }
+
+            var targetXRight = oldXLeft + minPitch;
+            var delta = targetXRight - oldXRight;
+
+            foreach (var id in positions.Keys.ToList())
+            {
+                if (id == rightId)
+                {
+                    continue;
+                }
+
+                var (x, y) = positions[id];
+                if (x > oldXRight)
+                {
+                    positions[id] = (x + delta, y);
+                }
+            }
+
+            var yR = positions[rightId].Y;
+            positions[rightId] = (targetXRight, yR);
+        }
+    }
+
+    /// <summary>Same-row clusters (Y within 4px); sweep X until minimum spacing holds.</summary>
+    private static void ApplyGenerationOverlapRemoval(Dictionary<string, (double X, double Y)> positions)
+    {
+        if (positions.Count == 0)
+        {
+            return;
+        }
+
+        var minPitch = NODE_WIDTH + H_GAP;
+        var sortedByY = positions.Keys.OrderBy(id => positions[id].Y).ToList();
+        var idx = 0;
+        while (idx < sortedByY.Count)
+        {
+            var groupStartY = positions[sortedByY[idx]].Y;
+            var next = idx;
+            while (next < sortedByY.Count && positions[sortedByY[next]].Y - groupStartY <= 4.0)
+            {
+                next++;
+            }
+
+            var rowIds = sortedByY.Skip(idx).Take(next - idx).ToList();
+            var guard = 0;
+            var changed = true;
+            while (changed && guard++ < rowIds.Count * 8)
+            {
+                changed = false;
+                rowIds.Sort((a, b) => positions[a].X.CompareTo(positions[b].X));
+                for (var k = 0; k < rowIds.Count - 1; k++)
+                {
+                    var xk = positions[rowIds[k]].X;
+                    var xk1 = positions[rowIds[k + 1]].X;
+                    if (xk1 - xk < minPitch - 1e-9)
+                    {
+                        var delta = minPitch - (xk1 - xk);
+                        for (var m = k + 1; m < rowIds.Count; m++)
+                        {
+                            var id = rowIds[m];
+                            var (x, y) = positions[id];
+                            positions[id] = (x + delta, y);
+                        }
+
+                        changed = true;
+                    }
+                }
+            }
+
+            idx = next;
+        }
+    }
+
+    /// <summary>Align left margin to H_GAP; align top to Y=0 for predictable viewBox.</summary>
+    private static void RecenterLayoutPositions(Dictionary<string, (double X, double Y)> positions)
+    {
+        if (positions.Count == 0)
+        {
+            return;
+        }
+
+        var minX = positions.Values.Min(p => p.X);
+        var minY = positions.Values.Min(p => p.Y);
+        var dx = H_GAP - minX;
+        var dy = -minY;
+        foreach (var id in positions.Keys.ToList())
+        {
+            var (x, y) = positions[id];
+            positions[id] = (x + dx, y + dy);
+        }
+    }
+
     private static void PropagateGenerations(GedcomDocument document, Dictionary<string, int> gen)
     {
         var changed = true;
@@ -158,121 +275,62 @@
         }
     }
 
-    /// <summary>Start sorted by id, then pull each wife immediately right of husband so pairs from GEDCOM sit adjacent.</summary>
-    private static List<string> OrderRow(int g, GedcomDocument doc, Dictionary<string, int> gen)
-    {
-        var atG = gen.Where(kv => kv.Value == g).Select(kv => kv.Key).ToList();
-        if (atG.Count == 0)
-        {
-            return new List<string>();
-        }
-
-        var ids = atG.OrderBy(x => x, StringComparer.Ordinal).ToList();
-        var pairs = new List<(string H, string W)>();
-        foreach (var f in doc.Families.OrderBy(x => x.Id, StringComparer.Ordinal))
-        {
-            if (string.IsNullOrEmpty(f.HusbandId) || string.IsNullOrEmpty(f.WifeId))
-            {
-                continue;
-            }
-
-            if (gen.GetValueOrDefault(f.HusbandId) != g || gen.GetValueOrDefault(f.WifeId) != g)
-            {
-                continue;
-            }
-
-            pairs.Add((f.HusbandId, f.WifeId));
-        }
-
-        var maxIter = ids.Count * pairs.Count + 20;
-        for (var iter = 0; iter < maxIter; iter++)
-        {
-            var moved = false;
-            foreach (var (h, w) in pairs)
-            {
-                var ih = ids.IndexOf(h);
-                var iw = ids.IndexOf(w);
-                if (ih < 0 || iw < 0)
-                {
-                    continue;
-                }
-
-                if (iw == ih + 1)
-                {
-                    continue;
-                }
-
-                ids.Remove(w);
-                ih = ids.IndexOf(h);
-                ids.Insert(ih + 1, w);
-                moved = true;
-            }
-
-            if (!moved)
-            {
-                break;
-            }
-        }
-
-        return ids;
-    }
-
+    /// <summary>Uses only final layout positions (post-processed); one pass after fixup.</summary>
     private static void AddFamilyConnectors(
         GedcomFamily f,
         Dictionary<string, int> gen,
-        Dictionary<string, double> xCenter,
+        Dictionary<string, (double X, double Y)> positions,
         List<LineSeg> segments)
     {
-        var kids = f.ChildrenIds.Where(c => gen.ContainsKey(c) && xCenter.ContainsKey(c)).ToList();
+        var kids = f.ChildrenIds.Where(c => gen.ContainsKey(c) && positions.ContainsKey(c)).ToList();
         if (kids.Count == 0)
         {
             return;
         }
 
+        var childrenLineY = kids.Min(id => positions[id].Y) - V_CONNECTOR_GAP;
+
         var pgH = !string.IsNullOrEmpty(f.HusbandId) && gen.TryGetValue(f.HusbandId!, out var gh) ? gh : (int?)null;
         var pgW = !string.IsNullOrEmpty(f.WifeId) && gen.TryGetValue(f.WifeId!, out var gw) ? gw : (int?)null;
 
         var h = f.HusbandId;
-        var w = f.WifeId;
+        var wif = f.WifeId;
 
-        if (!string.IsNullOrEmpty(h) && !string.IsNullOrEmpty(w) && pgH == pgW && pgH.HasValue
-            && xCenter.ContainsKey(h) && xCenter.ContainsKey(w))
+        if (!string.IsNullOrEmpty(h) && !string.IsNullOrEmpty(wif) && pgH == pgW && pgH.HasValue
+            && positions.ContainsKey(h) && positions.ContainsKey(wif))
         {
-            var g = pgH.Value;
-            var cxH = xCenter[h];
-            var cxW = xCenter[w];
-            var y = g * RowPitch;
-            var rowMidY = y + NODE_HEIGHT * 0.5;
-            var hRight = cxH + NODE_WIDTH * 0.5;
-            var wLeft = cxW - NODE_WIDTH * 0.5;
-            segments.Add(new LineSeg { X1 = hRight, Y1 = rowMidY, X2 = wLeft, Y2 = rowMidY });
+            var pH = positions[h];
+            var pW = positions[wif];
+            var leftId = pH.X <= pW.X ? h : wif;
+            var rightId = pH.X <= pW.X ? wif : h;
+            var left = positions[leftId];
+            var right = positions[rightId];
 
-            var coupleMidX = (hRight + wLeft) * 0.5;
-            var childTopY = (g + 1) * RowPitch;
-            var coupleForkY = rowMidY + (childTopY - rowMidY) * 0.5;
+            var coupleLineY = left.Y + NODE_HEIGHT * 0.5;
+            var xCouple1 = left.X + NODE_WIDTH;
+            var xCouple2 = right.X;
+            segments.Add(new LineSeg { X1 = xCouple1, Y1 = coupleLineY, X2 = xCouple2, Y2 = coupleLineY });
 
-            segments.Add(new LineSeg { X1 = coupleMidX, Y1 = rowMidY, X2 = coupleMidX, Y2 = coupleForkY });
+            var coupleMidX = (left.X + NODE_WIDTH + right.X) * 0.5;
 
-            if (kids.Count == 1)
+            segments.Add(new LineSeg { X1 = coupleMidX, Y1 = coupleLineY, X2 = coupleMidX, Y2 = childrenLineY });
+
+            var kidsByX = kids.OrderBy(c => positions[c].X).ToList();
+            var leftmost = kidsByX[0];
+            var rightmost = kidsByX[^1];
+            var xHoriz1 = positions[leftmost].X + NODE_WIDTH * 0.5;
+            var xHoriz2 = positions[rightmost].X + NODE_WIDTH * 0.5;
+            segments.Add(new LineSeg { X1 = xHoriz1, Y1 = childrenLineY, X2 = xHoriz2, Y2 = childrenLineY });
+
+            foreach (var c in kids)
             {
-                var ccx = xCenter[kids[0]];
-                if (Math.Abs(ccx - coupleMidX) > 0.01)
+                var pc = positions[c];
+                var childCenterX = pc.X + NODE_WIDTH * 0.5;
+                var y1 = childrenLineY;
+                var y2 = pc.Y;
+                if (Math.Abs(y2 - y1) > 1e-6)
                 {
-                    segments.Add(new LineSeg { X1 = coupleMidX, Y1 = coupleForkY, X2 = ccx, Y2 = coupleForkY });
-                }
-
-                segments.Add(new LineSeg { X1 = ccx, Y1 = coupleForkY, X2 = ccx, Y2 = childTopY });
-            }
-            else
-            {
-                var xs = kids.Select(c => xCenter[c]).ToList();
-                var minX = xs.Min();
-                var maxX = xs.Max();
-                segments.Add(new LineSeg { X1 = minX, Y1 = coupleForkY, X2 = maxX, Y2 = coupleForkY });
-                foreach (var c in kids)
-                {
-                    var x = xCenter[c];
-                    segments.Add(new LineSeg { X1 = x, Y1 = coupleForkY, X2 = x, Y2 = childTopY });
+                    segments.Add(new LineSeg { X1 = childCenterX, Y1 = y1, X2 = childCenterX, Y2 = y2 });
                 }
             }
 
@@ -281,25 +339,25 @@
 
         string? parent = null;
         int? pg = null;
-        if (!string.IsNullOrEmpty(h) && xCenter.ContainsKey(h) && pgH.HasValue)
+        if (!string.IsNullOrEmpty(h) && positions.ContainsKey(h) && pgH.HasValue)
         {
             parent = h;
             pg = pgH;
         }
-        else if (!string.IsNullOrEmpty(w) && xCenter.ContainsKey(w) && pgW.HasValue)
+        else if (!string.IsNullOrEmpty(wif) && positions.ContainsKey(wif) && pgW.HasValue)
         {
-            parent = w;
+            parent = wif;
             pg = pgW;
         }
-        else if (!string.IsNullOrEmpty(h) && xCenter.ContainsKey(h))
+        else if (!string.IsNullOrEmpty(h) && positions.ContainsKey(h))
         {
             parent = h;
             pg = gen.GetValueOrDefault(h);
         }
-        else if (!string.IsNullOrEmpty(w) && xCenter.ContainsKey(w))
+        else if (!string.IsNullOrEmpty(wif) && positions.ContainsKey(wif))
         {
-            parent = w;
-            pg = gen.GetValueOrDefault(w);
+            parent = wif;
+            pg = gen.GetValueOrDefault(wif);
         }
 
         if (parent is null || !pg.HasValue)
@@ -307,36 +365,36 @@
             return;
         }
 
-        var cx = xCenter[parent];
-        var py = pg.Value * RowPitch;
-        var bottomY = py + NODE_HEIGHT;
-        var cTop = (pg.Value + 1) * RowPitch;
-        var forkY = bottomY + (cTop - bottomY) * 0.5;
+        var pParent = positions[parent];
+        var cx = pParent.X + NODE_WIDTH * 0.5;
+        var bottomY = pParent.Y + NODE_HEIGHT;
 
-        segments.Add(new LineSeg { X1 = cx, Y1 = bottomY, X2 = cx, Y2 = forkY });
+        segments.Add(new LineSeg { X1 = cx, Y1 = bottomY, X2 = cx, Y2 = childrenLineY });
 
-        if (kids.Count == 1)
+        foreach (var c in kids)
         {
-            var ccx = xCenter[kids[0]];
-            if (Math.Abs(ccx - cx) > 0.01)
+            var ccx = positions[c].X + NODE_WIDTH * 0.5;
+            var childY = positions[c].Y;
+            if (Math.Abs(ccx - cx) > NODE_WIDTH)
             {
-                segments.Add(new LineSeg { X1 = cx, Y1 = forkY, X2 = ccx, Y2 = forkY });
+                var routeY = pParent.Y - V_GAP * 0.5;
+                if (routeY < 0)
+                {
+                    routeY = childrenLineY;
+                }
+
+                segments.Add(new LineSeg { X1 = cx, Y1 = childrenLineY, X2 = cx, Y2 = routeY });
+                segments.Add(new LineSeg { X1 = cx, Y1 = routeY, X2 = ccx, Y2 = routeY });
+                segments.Add(new LineSeg { X1 = ccx, Y1 = routeY, X2 = ccx, Y2 = childY });
             }
-
-            segments.Add(new LineSeg { X1 = ccx, Y1 = forkY, X2 = ccx, Y2 = cTop });
-        }
-        else
-        {
-            var xs = kids.Select(c => xCenter[c]).ToList();
-            var minX = xs.Min();
-            var maxX = xs.Max();
-            var minSeg = Math.Min(cx, minX);
-            var maxSeg = Math.Max(cx, maxX);
-            segments.Add(new LineSeg { X1 = minSeg, Y1 = forkY, X2 = maxSeg, Y2 = forkY });
-            foreach (var c in kids)
+            else if (Math.Abs(ccx - cx) > 0.01)
             {
-                var x = xCenter[c];
-                segments.Add(new LineSeg { X1 = x, Y1 = forkY, X2 = x, Y2 = cTop });
+                segments.Add(new LineSeg { X1 = cx, Y1 = childrenLineY, X2 = ccx, Y2 = childrenLineY });
+                segments.Add(new LineSeg { X1 = ccx, Y1 = childrenLineY, X2 = ccx, Y2 = childY });
+            }
+            else
+            {
+                segments.Add(new LineSeg { X1 = ccx, Y1 = childrenLineY, X2 = ccx, Y2 = childY });
             }
         }
     }
