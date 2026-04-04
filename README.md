@@ -45,7 +45,7 @@ Exportovaný soubor lze otevřít v libovolném genealogickém programu
 
 - [Blazor WebAssembly](https://dotnet.microsoft.com/apps/aspnet/web-apps/blazor) — běží přímo v prohlížeči, bez serveru
 - .NET 10
-- Čisté SVG pro vizualizaci — žádné externí knihovny
+- Čisté SVG pro vizualizaci
 
 ## Licence
 
