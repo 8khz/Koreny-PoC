@@ -9,7 +9,6 @@ builder.RootComponents.Add<HeadOutlet>("head::after");
 
 builder.Services.AddSingleton<GedcomParser>();
 builder.Services.AddSingleton<AppState>();
-builder.Services.AddSingleton<FamilyGraphLayoutService>();
 builder.Services.AddScoped(sp => new HttpClient { BaseAddress = new Uri(builder.HostEnvironment.BaseAddress) });
 
 await builder.Build().RunAsync();

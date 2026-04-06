@@ -1,402 +1,346 @@
 @using System.Text
+@using System.Text.Json
 @using Koreny.Models
-@using Koreny.Services
+@using Microsoft.JSInterop
 
-@inject FamilyGraphLayoutService LayoutService
+@inject IJSRuntime JS
 
-@* Positions from GraphShape Sugiyama via FamilyGraphLayoutService. *@
+@* Virtual family nodes (F…) separate marriage from parent/child ranks so Dagre does not treat spouses as parent/child. *@
 
 @code {
     public const double NODE_WIDTH = 160;
     public const double NODE_HEIGHT = 56;
-    public const double H_GAP = 24;
-    public const double V_GAP = 80;
-
-    private const double V_CONNECTOR_GAP = V_GAP / 2.0;
-
+    private const double FamilyNodeSize = 8;
+    private const double FamilyDotR = 4;
+    private const double Padding = 24;
     private const double NameLineY = 22;
     private const double LifespanLineY = 42;
     private const int MaxNameChars = 26;
 
+    private static readonly JsonSerializerOptions JsonOpts = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNameCaseInsensitive = true,
+    };
+
     [Parameter]
     public GedcomDocument? Document { get; set; }
 
-    public string RenderToSvg()
-    {
-        return RenderToSvg(Document, LayoutService);
-    }
+    /// <summary>Uses injected <see cref="IJSRuntime"/> when <see cref="Document"/> is set.</summary>
+    public Task<string> RenderToSvgAsync() => RenderToSvgAsync(Document, JS).AsTask();
 
-    public static string RenderToSvg(GedcomDocument? document, FamilyGraphLayoutService layoutService)
+    public static async ValueTask<string> RenderToSvgAsync(GedcomDocument? document, IJSRuntime js)
     {
         if (document is null || document.Individuals.Count == 0)
         {
             return EmptySvg("No individuals.");
         }
 
-        var raw = layoutService.ComputeLayout(document);
-        if (raw.Count == 0)
+        var nodes = new List<NodeJson>();
+        foreach (var ind in document.Individuals)
+        {
+            nodes.Add(new NodeJson
+            {
+                Id = IndividualKey(ind.Id),
+                Width = NODE_WIDTH,
+                Height = NODE_HEIGHT,
+            });
+        }
+
+        foreach (var fam in document.Families)
+        {
+            nodes.Add(new NodeJson
+            {
+                Id = FamilyKey(fam.Id),
+                Width = FamilyNodeSize,
+                Height = FamilyNodeSize,
+            });
+        }
+
+        var edges = new List<EdgeJson>();
+        foreach (var fam in document.Families)
+        {
+            var fk = FamilyKey(fam.Id);
+            if (!string.IsNullOrEmpty(fam.HusbandId))
+            {
+                edges.Add(new EdgeJson { From = IndividualKey(fam.HusbandId!), To = fk });
+            }
+
+            if (!string.IsNullOrEmpty(fam.WifeId))
+            {
+                edges.Add(new EdgeJson { From = IndividualKey(fam.WifeId!), To = fk });
+            }
+
+            foreach (var c in fam.ChildrenIds)
+            {
+                if (string.IsNullOrEmpty(c))
+                {
+                    continue;
+                }
+
+                edges.Add(new EdgeJson { From = fk, To = IndividualKey(c) });
+            }
+        }
+
+        if (nodes.Count == 0)
+        {
+            return EmptySvg("No nodes.");
+        }
+
+        var nodesJson = JsonSerializer.Serialize(nodes, JsonOpts);
+        var edgesJson = JsonSerializer.Serialize(edges, JsonOpts);
+
+        string resultJson;
+        try
+        {
+            resultJson = await js.InvokeAsync<string>(
+                "KorenyDagre.computeLayout",
+                nodesJson,
+                edgesJson,
+                NODE_WIDTH,
+                NODE_HEIGHT);
+        }
+        catch (JSException)
+        {
+            return EmptySvg("Layout failed (is Dagre loaded?).");
+        }
+
+        var layout = JsonSerializer.Deserialize<DagreLayoutResult>(resultJson, JsonOpts);
+        if (layout?.Nodes is null || layout.Nodes.Count == 0)
         {
             return EmptySvg("No layout.");
         }
 
         var positions = new Dictionary<string, (double X, double Y)>(StringComparer.Ordinal);
-        foreach (var kv in raw)
+        foreach (var n in layout.Nodes)
         {
-            positions[kv.Key] = kv.Value;
+            positions[n.Id] = (n.X, n.Y);
         }
 
-        ApplyPartnerSeparation(document, positions);
-        ApplyGenerationOverlapRemoval(positions);
-        RecenterLayoutPositions(positions);
+        var minX = double.PositiveInfinity;
+        var minY = double.PositiveInfinity;
+        var maxX = double.NegativeInfinity;
+        var maxY = double.NegativeInfinity;
 
-        var gen = new Dictionary<string, int>(StringComparer.Ordinal);
-        var childIds = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var f in document.Families)
+        void IncludeRect(double x, double y, double w, double h)
         {
-            foreach (var c in f.ChildrenIds)
-            {
-                childIds.Add(c);
-            }
+            minX = Math.Min(minX, x);
+            minY = Math.Min(minY, y);
+            maxX = Math.Max(maxX, x + w);
+            maxY = Math.Max(maxY, y + h);
+        }
+
+        void IncludePoint(double x, double y)
+        {
+            minX = Math.Min(minX, x);
+            minY = Math.Min(minY, y);
+            maxX = Math.Max(maxX, x);
+            maxY = Math.Max(maxY, y);
         }
 
         foreach (var ind in document.Individuals)
         {
-            if (!childIds.Contains(ind.Id))
-            {
-                gen[ind.Id] = 0;
-            }
-        }
-
-        if (gen.Count == 0)
-        {
-            return EmptySvg("No root persons (everyone is a child).");
-        }
-
-        PropagateGenerations(document, gen);
-        foreach (var ind in document.Individuals)
-        {
-            if (!gen.ContainsKey(ind.Id))
-            {
-                gen[ind.Id] = 0;
-            }
-        }
-
-        var totalW = positions.Values.Max(p => p.X + NODE_WIDTH) + H_GAP;
-        var totalH = positions.Values.Max(p => p.Y + NODE_HEIGHT) + V_GAP;
-
-        var boxes = new List<PersonBox>();
-        foreach (var ind in document.Individuals)
-        {
-            if (!positions.TryGetValue(ind.Id, out var p))
+            if (!positions.TryGetValue(IndividualKey(ind.Id), out var p))
             {
                 continue;
             }
 
-            boxes.Add(MakeBox(document, ind.Id, p.X + NODE_WIDTH * 0.5, p.Y));
+            IncludeRect(p.X, p.Y, NODE_WIDTH, NODE_HEIGHT);
         }
 
-        var segments = new List<LineSeg>();
-        foreach (var f in document.Families)
+        foreach (var fam in document.Families)
         {
-            AddFamilyConnectors(f, gen, positions, segments);
+            if (!positions.TryGetValue(FamilyKey(fam.Id), out var fp))
+            {
+                continue;
+            }
+
+            IncludeRect(fp.X, fp.Y, FamilyNodeSize, FamilyNodeSize);
         }
 
-        return BuildSvgXml(totalW, totalH, segments, boxes);
-    }
-
-    /// <summary>Separate spouses that Sugiyama placed too close; ripple shift keeps global order.</summary>
-    private static void ApplyPartnerSeparation(GedcomDocument document, Dictionary<string, (double X, double Y)> positions)
-    {
-        var minPitch = NODE_WIDTH + H_GAP;
-        foreach (var fam in document.Families.OrderBy(f => f.Id, StringComparer.Ordinal))
+        foreach (var fam in document.Families)
         {
-            var h = fam.HusbandId;
-            var wif = fam.WifeId;
-            if (string.IsNullOrEmpty(h) || string.IsNullOrEmpty(wif))
+            if (!positions.TryGetValue(FamilyKey(fam.Id), out var pF))
             {
                 continue;
             }
 
-            if (!positions.TryGetValue(h, out var pH) || !positions.TryGetValue(wif, out var pW))
+            if (!string.IsNullOrEmpty(fam.HusbandId)
+                && positions.TryGetValue(IndividualKey(fam.HusbandId!), out var pH))
             {
-                continue;
+                IncludeOrthogonalParentToFamilyBounds(pH, pF, IncludePoint);
             }
 
-            string leftId;
-            string rightId;
-            double oldXLeft;
-            double oldXRight;
-            if (pH.X <= pW.X)
+            if (!string.IsNullOrEmpty(fam.WifeId)
+                && positions.TryGetValue(IndividualKey(fam.WifeId!), out var pW))
             {
-                leftId = h;
-                rightId = wif;
-                oldXLeft = pH.X;
-                oldXRight = pW.X;
-            }
-            else
-            {
-                leftId = wif;
-                rightId = h;
-                oldXLeft = pW.X;
-                oldXRight = pH.X;
+                IncludeOrthogonalParentToFamilyBounds(pW, pF, IncludePoint);
             }
 
-            if (oldXRight - oldXLeft >= minPitch - 1e-9)
+            foreach (var c in fam.ChildrenIds)
             {
-                continue;
-            }
-
-            var targetXRight = oldXLeft + minPitch;
-            var delta = targetXRight - oldXRight;
-
-            foreach (var id in positions.Keys.ToList())
-            {
-                if (id == rightId)
+                if (string.IsNullOrEmpty(c))
                 {
                     continue;
                 }
 
-                var (x, y) = positions[id];
-                if (x > oldXRight)
-                {
-                    positions[id] = (x + delta, y);
-                }
-            }
-
-            var yR = positions[rightId].Y;
-            positions[rightId] = (targetXRight, yR);
-        }
-    }
-
-    /// <summary>Same-row clusters (Y within 4px); sweep X until minimum spacing holds.</summary>
-    private static void ApplyGenerationOverlapRemoval(Dictionary<string, (double X, double Y)> positions)
-    {
-        if (positions.Count == 0)
-        {
-            return;
-        }
-
-        var minPitch = NODE_WIDTH + H_GAP;
-        var sortedByY = positions.Keys.OrderBy(id => positions[id].Y).ToList();
-        var idx = 0;
-        while (idx < sortedByY.Count)
-        {
-            var groupStartY = positions[sortedByY[idx]].Y;
-            var next = idx;
-            while (next < sortedByY.Count && positions[sortedByY[next]].Y - groupStartY <= 4.0)
-            {
-                next++;
-            }
-
-            var rowIds = sortedByY.Skip(idx).Take(next - idx).ToList();
-            var guard = 0;
-            var changed = true;
-            while (changed && guard++ < rowIds.Count * 8)
-            {
-                changed = false;
-                rowIds.Sort((a, b) => positions[a].X.CompareTo(positions[b].X));
-                for (var k = 0; k < rowIds.Count - 1; k++)
-                {
-                    var xk = positions[rowIds[k]].X;
-                    var xk1 = positions[rowIds[k + 1]].X;
-                    if (xk1 - xk < minPitch - 1e-9)
-                    {
-                        var delta = minPitch - (xk1 - xk);
-                        for (var m = k + 1; m < rowIds.Count; m++)
-                        {
-                            var id = rowIds[m];
-                            var (x, y) = positions[id];
-                            positions[id] = (x + delta, y);
-                        }
-
-                        changed = true;
-                    }
-                }
-            }
-
-            idx = next;
-        }
-    }
-
-    /// <summary>Align left margin to H_GAP; align top to Y=0 for predictable viewBox.</summary>
-    private static void RecenterLayoutPositions(Dictionary<string, (double X, double Y)> positions)
-    {
-        if (positions.Count == 0)
-        {
-            return;
-        }
-
-        var minX = positions.Values.Min(p => p.X);
-        var minY = positions.Values.Min(p => p.Y);
-        var dx = H_GAP - minX;
-        var dy = -minY;
-        foreach (var id in positions.Keys.ToList())
-        {
-            var (x, y) = positions[id];
-            positions[id] = (x + dx, y + dy);
-        }
-    }
-
-    private static void PropagateGenerations(GedcomDocument document, Dictionary<string, int> gen)
-    {
-        var changed = true;
-        var guard = 0;
-        while (changed && guard++ < document.Individuals.Count + document.Families.Count + 10)
-        {
-            changed = false;
-            foreach (var fam in document.Families)
-            {
-                var pg = -1;
-                if (!string.IsNullOrEmpty(fam.HusbandId) && gen.TryGetValue(fam.HusbandId, out var gh))
-                {
-                    pg = Math.Max(pg, gh);
-                }
-
-                if (!string.IsNullOrEmpty(fam.WifeId) && gen.TryGetValue(fam.WifeId, out var gw))
-                {
-                    pg = Math.Max(pg, gw);
-                }
-
-                if (pg < 0)
+                if (!positions.TryGetValue(IndividualKey(c), out var pC))
                 {
                     continue;
                 }
 
-                foreach (var c in fam.ChildrenIds)
-                {
-                    var ng = pg + 1;
-                    if (!gen.TryGetValue(c, out var old) || old < ng)
-                    {
-                        gen[c] = ng;
-                        changed = true;
-                    }
-                }
+                IncludeOrthogonalFamilyToChildBounds(pF, pC, IncludePoint);
             }
         }
+
+        if (double.IsInfinity(minX) || double.IsInfinity(minY))
+        {
+            return EmptySvg("No bounds.");
+        }
+
+        var ox = minX - Padding;
+        var oy = minY - Padding;
+        var width = maxX - minX + 2 * Padding;
+        var height = maxY - minY + 2 * Padding;
+
+        var sb = new StringBuilder();
+        sb.Append(CultureInv($"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">"""));
+        sb.Append(CultureInv($"""<rect x="0" y="0" width="{width}" height="{height}" fill="white" />"""));
+        sb.Append("""<g fill="none" stroke="#333" stroke-width="1.5">""");
+
+        foreach (var fam in document.Families)
+        {
+            if (!positions.TryGetValue(FamilyKey(fam.Id), out var pF))
+            {
+                continue;
+            }
+
+            if (!string.IsNullOrEmpty(fam.HusbandId)
+                && positions.TryGetValue(IndividualKey(fam.HusbandId!), out var pH))
+            {
+                sb.Append(CultureInv(
+                    $"""<path d="{OrthogonalParentToFamilyPath(ox, oy, pH, pF)}" />"""));
+            }
+
+            if (!string.IsNullOrEmpty(fam.WifeId)
+                && positions.TryGetValue(IndividualKey(fam.WifeId!), out var pW))
+            {
+                sb.Append(CultureInv(
+                    $"""<path d="{OrthogonalParentToFamilyPath(ox, oy, pW, pF)}" />"""));
+            }
+
+            foreach (var c in fam.ChildrenIds)
+            {
+                if (string.IsNullOrEmpty(c))
+                {
+                    continue;
+                }
+
+                if (!positions.TryGetValue(IndividualKey(c), out var pC))
+                {
+                    continue;
+                }
+
+                sb.Append(CultureInv(
+                    $"""<path d="{OrthogonalFamilyToChildPath(ox, oy, pF, pC)}" />"""));
+            }
+        }
+
+        sb.Append("</g><g>");
+
+        foreach (var fam in document.Families)
+        {
+            if (!positions.TryGetValue(FamilyKey(fam.Id), out var fp))
+            {
+                continue;
+            }
+
+            var fcx = fp.X + FamilyNodeSize * 0.5 - ox;
+            var fcy = fp.Y + FamilyNodeSize * 0.5 - oy;
+            sb.Append(CultureInv($"""<circle cx="{fcx}" cy="{fcy}" r="{FamilyDotR}" fill="#888780" stroke="none" />"""));
+        }
+
+        sb.Append("</g><g>");
+
+        foreach (var ind in document.Individuals)
+        {
+            if (!positions.TryGetValue(IndividualKey(ind.Id), out var p))
+            {
+                continue;
+            }
+
+            var left = p.X - ox;
+            var top = p.Y - oy;
+            var cx = left + NODE_WIDTH * 0.5;
+            var name = ind.FullName;
+            name = string.IsNullOrWhiteSpace(name) ? ind.Id : name;
+            sb.Append(CultureInv($"""<rect x="{left}" y="{top}" width="{NODE_WIDTH}" height="{NODE_HEIGHT}" fill="{FillFor(ind)}" stroke="#1a1a1a" />"""));
+            sb.Append(CultureInv($"""<text x="{cx}" y="{top + NameLineY}" text-anchor="middle" font-size="13" fill="white">{SvgEscape(Truncate(name))}</text>"""));
+            sb.Append(CultureInv($"""<text x="{cx}" y="{top + LifespanLineY}" text-anchor="middle" font-size="13" fill="white">{SvgEscape(FormatLife(ind))}</text>"""));
+        }
+
+        sb.Append("</g></svg>");
+        return sb.ToString();
     }
 
-    /// <summary>Uses only final layout positions (post-processed); one pass after fixup.</summary>
-    private static void AddFamilyConnectors(
-        GedcomFamily f,
-        Dictionary<string, int> gen,
-        Dictionary<string, (double X, double Y)> positions,
-        List<LineSeg> segments)
+    private static string CultureInv(FormattableString fs) => FormattableString.Invariant(fs);
+
+    private static string IndividualKey(string id) => $"I{id}";
+
+    private static string FamilyKey(string id) => $"F{id}";
+
+    private static string OrthogonalParentToFamilyPath(double ox, double oy, (double X, double Y) parent, (double X, double Y) fam)
     {
-        var kids = f.ChildrenIds.Where(c => gen.ContainsKey(c) && positions.ContainsKey(c)).ToList();
-        if (kids.Count == 0)
-        {
-            return;
-        }
+        var parentCentreX = parent.X + NODE_WIDTH * 0.5 - ox;
+        var parentBottom = parent.Y + NODE_HEIGHT - oy;
+        var familyNodeX = fam.X - ox;
+        var familyNodeY = fam.Y - oy;
+        var ymid = (parentBottom + familyNodeY) * 0.5;
+        return FormattableString.Invariant(
+            $"M {N(parentCentreX)} {N(parentBottom)} L {N(parentCentreX)} {N(ymid)} L {N(familyNodeX)} {N(ymid)} L {N(familyNodeX)} {N(familyNodeY)}");
+    }
 
-        var childrenLineY = kids.Min(id => positions[id].Y) - V_CONNECTOR_GAP;
+    private static string OrthogonalFamilyToChildPath(double ox, double oy, (double X, double Y) fam, (double X, double Y) child)
+    {
+        var familyNodeX = fam.X - ox;
+        var familyNodeY = fam.Y - oy;
+        var childCentreX = child.X + NODE_WIDTH * 0.5 - ox;
+        var childTop = child.Y - oy;
+        var childMidY = (familyNodeY + childTop) * 0.5;
+        return FormattableString.Invariant(
+            $"M {N(familyNodeX)} {N(familyNodeY)} L {N(familyNodeX)} {N(childMidY)} L {N(childCentreX)} {N(childMidY)} L {N(childCentreX)} {N(childTop)}");
+    }
 
-        var pgH = !string.IsNullOrEmpty(f.HusbandId) && gen.TryGetValue(f.HusbandId!, out var gh) ? gh : (int?)null;
-        var pgW = !string.IsNullOrEmpty(f.WifeId) && gen.TryGetValue(f.WifeId!, out var gw) ? gw : (int?)null;
+    private static void IncludeOrthogonalParentToFamilyBounds(
+        (double X, double Y) parent,
+        (double X, double Y) fam,
+        Action<double, double> includePoint)
+    {
+        var parentCentreX = parent.X + NODE_WIDTH * 0.5;
+        var parentBottom = parent.Y + NODE_HEIGHT;
+        var familyNodeX = fam.X;
+        var familyNodeY = fam.Y;
+        var ymid = (parentBottom + familyNodeY) * 0.5;
+        includePoint(parentCentreX, parentBottom);
+        includePoint(parentCentreX, ymid);
+        includePoint(familyNodeX, ymid);
+        includePoint(familyNodeX, familyNodeY);
+    }
 
-        var h = f.HusbandId;
-        var wif = f.WifeId;
-
-        if (!string.IsNullOrEmpty(h) && !string.IsNullOrEmpty(wif) && pgH == pgW && pgH.HasValue
-            && positions.ContainsKey(h) && positions.ContainsKey(wif))
-        {
-            var pH = positions[h];
-            var pW = positions[wif];
-            var leftId = pH.X <= pW.X ? h : wif;
-            var rightId = pH.X <= pW.X ? wif : h;
-            var left = positions[leftId];
-            var right = positions[rightId];
-
-            var coupleLineY = left.Y + NODE_HEIGHT * 0.5;
-            var xCouple1 = left.X + NODE_WIDTH;
-            var xCouple2 = right.X;
-            segments.Add(new LineSeg { X1 = xCouple1, Y1 = coupleLineY, X2 = xCouple2, Y2 = coupleLineY });
-
-            var coupleMidX = (left.X + NODE_WIDTH + right.X) * 0.5;
-
-            segments.Add(new LineSeg { X1 = coupleMidX, Y1 = coupleLineY, X2 = coupleMidX, Y2 = childrenLineY });
-
-            var kidsByX = kids.OrderBy(c => positions[c].X).ToList();
-            var leftmost = kidsByX[0];
-            var rightmost = kidsByX[^1];
-            var xHoriz1 = positions[leftmost].X + NODE_WIDTH * 0.5;
-            var xHoriz2 = positions[rightmost].X + NODE_WIDTH * 0.5;
-            segments.Add(new LineSeg { X1 = xHoriz1, Y1 = childrenLineY, X2 = xHoriz2, Y2 = childrenLineY });
-
-            foreach (var c in kids)
-            {
-                var pc = positions[c];
-                var childCenterX = pc.X + NODE_WIDTH * 0.5;
-                var y1 = childrenLineY;
-                var y2 = pc.Y;
-                if (Math.Abs(y2 - y1) > 1e-6)
-                {
-                    segments.Add(new LineSeg { X1 = childCenterX, Y1 = y1, X2 = childCenterX, Y2 = y2 });
-                }
-            }
-
-            return;
-        }
-
-        string? parent = null;
-        int? pg = null;
-        if (!string.IsNullOrEmpty(h) && positions.ContainsKey(h) && pgH.HasValue)
-        {
-            parent = h;
-            pg = pgH;
-        }
-        else if (!string.IsNullOrEmpty(wif) && positions.ContainsKey(wif) && pgW.HasValue)
-        {
-            parent = wif;
-            pg = pgW;
-        }
-        else if (!string.IsNullOrEmpty(h) && positions.ContainsKey(h))
-        {
-            parent = h;
-            pg = gen.GetValueOrDefault(h);
-        }
-        else if (!string.IsNullOrEmpty(wif) && positions.ContainsKey(wif))
-        {
-            parent = wif;
-            pg = gen.GetValueOrDefault(wif);
-        }
-
-        if (parent is null || !pg.HasValue)
-        {
-            return;
-        }
-
-        var pParent = positions[parent];
-        var cx = pParent.X + NODE_WIDTH * 0.5;
-        var bottomY = pParent.Y + NODE_HEIGHT;
-
-        segments.Add(new LineSeg { X1 = cx, Y1 = bottomY, X2 = cx, Y2 = childrenLineY });
-
-        foreach (var c in kids)
-        {
-            var ccx = positions[c].X + NODE_WIDTH * 0.5;
-            var childY = positions[c].Y;
-            if (Math.Abs(ccx - cx) > NODE_WIDTH)
-            {
-                var routeY = pParent.Y - V_GAP * 0.5;
-                if (routeY < 0)
-                {
-                    routeY = childrenLineY;
-                }
-
-                segments.Add(new LineSeg { X1 = cx, Y1 = childrenLineY, X2 = cx, Y2 = routeY });
-                segments.Add(new LineSeg { X1 = cx, Y1 = routeY, X2 = ccx, Y2 = routeY });
-                segments.Add(new LineSeg { X1 = ccx, Y1 = routeY, X2 = ccx, Y2 = childY });
-            }
-            else if (Math.Abs(ccx - cx) > 0.01)
-            {
-                segments.Add(new LineSeg { X1 = cx, Y1 = childrenLineY, X2 = ccx, Y2 = childrenLineY });
-                segments.Add(new LineSeg { X1 = ccx, Y1 = childrenLineY, X2 = ccx, Y2 = childY });
-            }
-            else
-            {
-                segments.Add(new LineSeg { X1 = ccx, Y1 = childrenLineY, X2 = ccx, Y2 = childY });
-            }
-        }
+    private static void IncludeOrthogonalFamilyToChildBounds(
+        (double X, double Y) fam,
+        (double X, double Y) child,
+        Action<double, double> includePoint)
+    {
+        var familyNodeX = fam.X;
+        var familyNodeY = fam.Y;
+        var childCentreX = child.X + NODE_WIDTH * 0.5;
+        var childTop = child.Y;
+        var childMidY = (familyNodeY + childTop) * 0.5;
+        includePoint(familyNodeX, familyNodeY);
+        includePoint(familyNodeX, childMidY);
+        includePoint(childCentreX, childMidY);
+        includePoint(childCentreX, childTop);
     }
 
     private static string N(double v) => v.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -407,53 +351,14 @@
         return $"""<svg xmlns="http://www.w3.org/2000/svg" width="320" height="80" viewBox="0 0 320 80"><text x="160" y="44" text-anchor="middle" font-size="13" fill="#333">{e}</text></svg>""";
     }
 
-    private static string BuildSvgXml(double width, double height, List<LineSeg> segments, List<PersonBox> boxes)
+    private static string FillFor(GedcomIndividual i)
     {
-        var sb = new StringBuilder();
-        sb.Append($"""<svg xmlns="http://www.w3.org/2000/svg" width="{N(width)}" height="{N(height)}" viewBox="0 0 {N(width)} {N(height)}">""");
-        sb.Append($"<rect x=\"0\" y=\"0\" width=\"{N(width)}\" height=\"{N(height)}\" fill=\"white\" />");
-        sb.Append("""<g stroke="#2a2a2a" stroke-width="1.5" fill="none">""");
-        foreach (var seg in segments)
-        {
-            sb.Append($"<line x1=\"{N(seg.X1)}\" y1=\"{N(seg.Y1)}\" x2=\"{N(seg.X2)}\" y2=\"{N(seg.Y2)}\" />");
-        }
-
-        sb.Append("</g><g>");
-        foreach (var box in boxes)
-        {
-            var left = box.CenterX - NODE_WIDTH * 0.5;
-            var top = box.Y;
-            sb.Append($"<rect x=\"{N(left)}\" y=\"{N(top)}\" width=\"{N(NODE_WIDTH)}\" height=\"{N(NODE_HEIGHT)}\" fill=\"{box.Fill}\" stroke=\"#1a1a1a\" />");
-            sb.Append($"<text x=\"{N(box.CenterX)}\" y=\"{N(top + NameLineY)}\" text-anchor=\"middle\" font-size=\"13\" fill=\"white\">{SvgEscape(box.FullName)}</text>");
-            sb.Append($"<text x=\"{N(box.CenterX)}\" y=\"{N(top + LifespanLineY)}\" text-anchor=\"middle\" font-size=\"13\" fill=\"white\">{SvgEscape(box.Lifespan)}</text>");
-        }
-
-        sb.Append("</g></svg>");
-        return sb.ToString();
-    }
-
-    private static PersonBox MakeBox(GedcomDocument document, string id, double centerX, double y)
-    {
-        var ind = FindIndividual(document, id);
-        var name = ind?.FullName ?? id;
-        return new PersonBox
-        {
-            CenterX = centerX,
-            Y = y,
-            FullName = Truncate(string.IsNullOrWhiteSpace(name) ? id : name),
-            Lifespan = FormatLife(ind),
-            Fill = FillFor(ind),
-        };
-    }
-
-    private static string FillFor(GedcomIndividual? i)
-    {
-        if (i?.Sex == "M")
+        if (i.Sex == "M")
         {
             return "#4A7FB5";
         }
 
-        if (i?.Sex == "F")
+        if (i.Sex == "F")
         {
             return "#9B2335";
         }
@@ -461,13 +366,8 @@
         return "#888780";
     }
 
-    private static string FormatLife(GedcomIndividual? i)
+    private static string FormatLife(GedcomIndividual i)
     {
-        if (i is null)
-        {
-            return "?";
-        }
-
         var b = i.Birth?.ParsedYear;
         var d = i.Death?.ParsedYear;
         if (b is not null && d is not null)
@@ -508,33 +408,28 @@
             .Replace("'", "&apos;", StringComparison.Ordinal);
     }
 
-    private static GedcomIndividual? FindIndividual(GedcomDocument doc, string id)
+    private sealed class NodeJson
     {
-        foreach (var i in doc.Individuals)
-        {
-            if (i.Id == id)
-            {
-                return i;
-            }
-        }
-
-        return null;
+        public string Id { get; set; } = "";
+        public double Width { get; set; }
+        public double Height { get; set; }
     }
 
-    private sealed class PersonBox
+    private sealed class EdgeJson
     {
-        public double CenterX { get; init; }
-        public double Y { get; init; }
-        public required string FullName { get; init; }
-        public required string Lifespan { get; init; }
-        public required string Fill { get; init; }
+        public string From { get; set; } = "";
+        public string To { get; set; } = "";
     }
 
-    private sealed class LineSeg
+    private sealed class DagreLayoutResult
     {
-        public double X1 { get; init; }
-        public double Y1 { get; init; }
-        public double X2 { get; init; }
-        public double Y2 { get; init; }
+        public List<DagreNodeLayout>? Nodes { get; set; }
+    }
+
+    private sealed class DagreNodeLayout
+    {
+        public string Id { get; set; } = "";
+        public double X { get; set; }
+        public double Y { get; set; }
     }
 }

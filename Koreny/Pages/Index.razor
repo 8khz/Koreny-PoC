@@ -4,7 +4,6 @@
 @implements IAsyncDisposable
 @inject GedcomParser Parser
 @inject AppState AppState
-@inject FamilyGraphLayoutService FamilyGraphLayout
 @inject IJSRuntime JSRuntime
 
 <PageTitle>Kořeny</PageTitle>
@@ -48,7 +47,7 @@
                 <div style="display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center;">
                     <button type="button" @onclick="OpenFullTreeOverlay" disabled="@(_doc is null || string.IsNullOrEmpty(_rootPersonId))">Celý strom</button>
                     <span aria-hidden="true">|</span>
-                    <button type="button" @onclick="OpenFullGraphOverlay" disabled="@(_doc is null)">Celý graf</button>
+                    <button type="button" @onclick="OpenFullGraphOverlayAsync" disabled="@(_doc is null)">Celý graf</button>
                     <span aria-hidden="true">|</span>
                     <button type="button" @onclick="DownloadToolbarSvgAsync" disabled="@(_doc is null)">Stáhnout SVG</button>
                     <span aria-hidden="true">|</span>
@@ -366,14 +365,14 @@
         }
     }
 
-    private void OpenFullGraphOverlay()
+    private async Task OpenFullGraphOverlayAsync()
     {
         if (_doc is null)
         {
             return;
         }
 
-        var svg = FullGraph.RenderToSvg(_doc, FamilyGraphLayout);
+        var svg = await FullGraph.RenderToSvgAsync(_doc, JSRuntime);
         _fullGraphSvgMarkup = svg;
         _fullGraphSvgDataUri = "data:image/svg+xml;base64," + Convert.ToBase64String(Encoding.UTF8.GetBytes(svg));
         _showFullGraphOverlay = true;
@@ -427,7 +426,7 @@
 
         var svg = !string.IsNullOrEmpty(_rootPersonId)
             ? DescendantTree.RenderToSvg(_doc, _rootPersonId)
-            : FullGraph.RenderToSvg(_doc, FamilyGraphLayout);
+            : await FullGraph.RenderToSvgAsync(_doc, JSRuntime);
 
         var module = await GetExportModuleAsync();
         await module.InvokeVoidAsync("downloadSvg", svg, "koreny-export.svg");
@@ -442,7 +441,7 @@
 
         var svg = !string.IsNullOrEmpty(_rootPersonId)
             ? DescendantTree.RenderToSvg(_doc, _rootPersonId)
-            : FullGraph.RenderToSvg(_doc, FamilyGraphLayout);
+            : await FullGraph.RenderToSvgAsync(_doc, JSRuntime);
 
         var module = await GetExportModuleAsync();
         await module.InvokeVoidAsync("printSvg", svg);
