@@ -149,6 +149,9 @@
                             @if (_doc is null || _doc.Individuals.Count == 0)
                             {
                                 <p>Nejdříve přidejte alespoň jednu osobu.</p>
+                                <div style="margin-top: 0.75rem; flex-shrink: 0;">
+                                    <button type="button" @onclick="CancelPanel">Zpět</button>
+                                </div>
                             }
                             else
                             {
